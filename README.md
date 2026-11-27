@@ -27,7 +27,9 @@ cmake --build build-mlx
   --prompt 'Explain KV caching in one sentence.' --max-tokens 48
 ```
 
-For cloud-first requests, set `CLOUD_BASE_URL` through `/v1`, set `CLOUD_MODEL` to the served model ID, and set `CLOUD_API_KEY` if required. Run the same command without `--offline`. Use `--demo --model DIR` to inject a 503 and run the local model without a cloud call. The JSON response identifies which source generated the text.
+### Cloud-first requests
+
+Set `CLOUD_BASE_URL` to the base URL ending in `/v1`, `CLOUD_MODEL` to the served model ID, and `CLOUD_API_KEY` if required. Run the same command without `--offline`. To inject a 503 and run the local model without a cloud call, use `--demo --model DIR`. The JSON response identifies the source of the generated text.
 
 In a local run on Apple Silicon with MLX 0.32.5, the loopback server returned HTTP 503. The 4-bit Llama 3.2 3B checkpoint then generated `4` for a short arithmetic prompt on Metal.
 
@@ -41,11 +43,13 @@ printf '%s\n' '{"prompt":"What is 2 + 2? Answer with a number only.","max_tokens
   ./build-mlx/edge_fallback --offline --batch --model /path/to/Llama-3.2-3B-Instruct-4bit
 ```
 
+### Weight reuse and timing
+
 The first local request loads the tokenizer and materializes the weights. Each request has its own KV cache, so one prompt never becomes part of the next request's context. The same batch interface can call the cloud first by omitting `--offline`. Local replies report whether the weights were reused, initial load time, prefill time, total local generation time, and token counts. Prefill time includes tokenization and the first decoding decision. Total generation time excludes weight loading and the cloud request.
 
 In a loopback HTTP 503 run on Apple Silicon, the first request returned `4` after loading the model in about 1,085 ms. An invalid input line produced an error. The next request returned `6` using the resident weights and reported zero load time.
 
-References: [MLX C++ build guide](https://github.com/ml-explore/mlx/blob/main/docs/src/dev/mlx_in_cpp.rst) and [Qwen2.5 architecture configuration](https://huggingface.co/Qwen/Qwen2.5-3B-Instruct/blob/main/config.json).
+[MLX C++ build guide](https://github.com/ml-explore/mlx/blob/main/docs/src/dev/mlx_in_cpp.rst) and [Qwen2.5 architecture configuration](https://huggingface.co/Qwen/Qwen2.5-3B-Instruct/blob/main/config.json).
 
 ## Back off during a cloud outage
 
@@ -62,9 +66,9 @@ arrives, before reading the response body. A timeout or disconnect before
 the end of those headers is a cloud request error. After the interval
 expires, the next request tries the cloud again. Another 503 starts a new
 interval.
-Local responses record `fallback_reason: "cloud_503"` for the initial
-response and `fallback_reason: "circuit_open"` with a null `cloud_status`
-for requests that skipped the cloud.
+
+- The initial fallback records `fallback_reason: "cloud_503"`.
+- Requests that skip the cloud record `fallback_reason: "circuit_open"` and a null `cloud_status`.
 
 The circuit starts closed and is disabled unless a cooldown is supplied.
 HTTP 429, other error statuses, and ambiguous transport failures remain
@@ -80,12 +84,16 @@ leading sequence evicts the old entry. Prompts with no suffix use ordinary
 prefill and leave the current entry intact. Each generation gets its own
 suffix and decode state.
 
+### Prefix memory
+
 The model checks the option against its context limit and a 256 MiB logical
 K/V budget calculated conservatively with four bytes per element. The limit
 covers the retained prefix. Layer activations, the request's full K/V cache,
 weights, and allocator overhead also use memory. Local replies report
 `reused_prefix_tokens`, `retained_prefix_tokens`, and `retained_prefix_bytes`.
 Pass `--trace-token-ids` to include the generated IDs for parity checks.
+
+### One-token A/B benchmark
 
 ```sh
 sh bench/prefix_ab.sh ./build-mlx/edge_fallback /path/to/checkpoint 1024 6 > paired.csv
@@ -119,7 +127,7 @@ These results describe prefill and one-token responses for this workload.
 
 ## Measure first-token and decode timing
 
-Each local result includes these fields in `local_metrics`.
+Read these fields in `local_metrics` on each local result.
 
 | Field | Measurement |
 |---|---|
@@ -129,10 +137,12 @@ Each local result includes these fields in `local_metrics`.
 | `stop_decision_ms` | Time from the last non-stop token through the extra stop-token decision, when both exist. |
 | `stop_reason` | `stop_token` for a model stop ID or `token_limit` for the requested output cap. |
 
-The batch CLI sends a complete JSON line after generation. The timings are
+The batch CLI writes the JSON line after generation finishes. The timings are
 local to the model and exclude cloud calls, initial model load and response
 delivery. `generation_ms` still covers detokenization and final local
 bookkeeping. `prefill_ms` also includes the first decision when it is a stop ID.
+
+### Multi-token A/B benchmark
 
 ```sh
 sh bench/long_decode_ab.sh ./build-mlx/edge_fallback /path/to/checkpoint 1024 4 > long-decode.csv
@@ -164,11 +174,15 @@ widely across processes, and the medians moved in different directions.
 
 ### Decode cache allocation
 
+#### Request order in the saved runs
+
 The saved 2,700-token pairs show a large request-order effect. With the
 2,700-token prompt first, both modes decoded at 15.91–29.97 tok/s. With it
 after the 4,620-token prompt, both modes fell to 3.74–9.15 tok/s. Three of
 four paired rate ratios also favored cache-off. The run does not isolate
 the effect of the retained prefix from process state.
+
+#### Reservation and Metal probe
 
 Both modes previously concatenated their full live KV arrays at each
 decode step. Decode now reserves up to 64 positions at a time within the
@@ -221,6 +235,8 @@ cmake --build build --parallel
 ctest --test-dir build --output-on-failure
 ```
 
+### Metal tests
+
 An MLX build also tests a deterministic, generated Qwen2-style checkpoint on
 Metal. The test checks dense attention, output token limits, EOS and context
 handling, and invalid checkpoint files. For the cached 4-bit Llama 3.2 3B
@@ -233,6 +249,8 @@ decode, prefix replacement, and an intervening short request. The dense
 fixture covers immediate EOS, EOS after multiple tokens, and token limits.
 Set `-DEDGE_TEST_LONG_DECODE=ON` with the Llama checkpoint and `jq` to run
 the long-prompt parity check in CTest.
+
+### Coverage
 
 To measure the application and MLX code, configure each build separately
 with Clang and `-DCMAKE_CXX_FLAGS="-fprofile-instr-generate -fcoverage-mapping"`.
