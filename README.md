@@ -114,6 +114,51 @@ runs the same code in both configurations and shows run-to-run variation.
 These results describe prefill and one-token responses for this workload.
 [Raw timing pairs](evidence/llama-3b-prefix-ab.csv) · [Build and checkpoint fingerprints](evidence/llama-3b-prefix-ab-environment.txt)
 
+## Measure first-token and decode timing
+
+Each local result includes these fields in `local_metrics`.
+
+| Field | Measurement |
+|---|---|
+| `ttft_ms` | Local generation start through the first synchronized non-stop token ID. Includes tokenization and prefill. Null when the first decision is a stop ID. |
+| `decode_ms` | First through last non-stop token decision. Null for fewer than two generated IDs. |
+| `decode_tokens_per_second` | Generated IDs after the first, divided by decode time. Null when there is no positive decode interval. |
+| `stop_decision_ms` | Time from the last non-stop token through the extra stop-token decision, when both exist. |
+| `stop_reason` | `stop_token` for a model stop ID or `token_limit` for the requested output cap. |
+
+The batch CLI sends a complete JSON line after generation. The timings are
+local to the model and exclude cloud calls, initial model load and response
+delivery. `generation_ms` still covers detokenization and final local
+bookkeeping. `prefill_ms` also includes the first decision when it is a stop ID.
+
+```sh
+sh bench/long_decode_ab.sh ./build-mlx/edge_fallback /path/to/checkpoint 1024 4 > long-decode.csv
+```
+
+Each process first seeds the 1,024-token prefix with a short decode. It then
+generates 48 tokens for each of two longer prompts. The runner alternates
+process and prompt-length order independently, compares all output IDs between cache-off
+and cache-on runs, and checks the decode arithmetic before emitting CSV.
+
+### Long prompts on Apple Metal
+
+Four release process pairs on an Apple M3 Pro ran 4-bit Llama 3.2 3B
+with MLX 0.32.5. Each process seeded the model and then ran both long
+shapes. All eight measured pairs produced identical text and generated
+token IDs between cache-off and cache-on, with 48 tokens per response.
+The table excludes the four seed rows. Both long shapes were first use
+within each model-resident process.
+
+| Prompt tokens | TTFT off → on, median | Decode off, median (range) | Decode on, median (range) |
+|---:|---:|---:|---:|
+| 2,700 | 3,737 → 2,265 ms | 14.70 tok/s (3.74–29.97) | 11.09 tok/s (4.53–28.45) |
+| 4,620 | 6,476 → 4,822 ms | 9.93 tok/s (4.10–16.33) | 10.43 tok/s (1.32–17.81) |
+
+Each decode rate uses 47 post-first-token intervals. Cache hits were
+faster to the first token in every measured pair. Decode rates varied
+widely across processes, and the medians moved in different directions.
+[Raw timing pairs](evidence/llama-3b-long-decode.csv) · [Environment and checksums](evidence/llama-3b-long-decode-environment.txt)
+
 ## Tests
 
 The default build tests the CLI against a local HTTP server. It covers cloud
@@ -134,7 +179,10 @@ integration test, configure `build-mlx` with
 Run `ctest --test-dir build-mlx --output-on-failure` to include the real
 checkpoint. A local server supplies the HTTP 503 responses. The prefix test
 checks exact token parity against ordinary prefill, including multi-token
-decode, prefix replacement, and an intervening short request.
+decode, prefix replacement, and an intervening short request. The dense
+fixture covers immediate EOS, EOS after multiple tokens, and token limits.
+Set `-DEDGE_TEST_LONG_DECODE=ON` with the Llama checkpoint and `jq` to run
+the long-prompt parity check in CTest.
 
 To measure the application and MLX code, configure each build separately
 with Clang and `-DCMAKE_CXX_FLAGS="-fprofile-instr-generate -fcoverage-mapping"`.
