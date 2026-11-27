@@ -1,8 +1,11 @@
+#include "cloud_circuit.hpp"
 #include "mlx_model.hpp"
 
 #include <curl/curl.h>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -40,7 +43,8 @@ std::size_t append_response(char* data, std::size_t size, std::size_t count, voi
     }
 }
 
-Reply call_cloud(std::string base, const std::string& model, const std::string& prompt, int max_tokens) {
+Reply call_cloud(std::string base, const std::string& model, const std::string& prompt,
+                 int max_tokens, long timeout_ms) {
     if (!(base.starts_with("https://") || base.starts_with("http://")) || model.empty()) {
         throw std::runtime_error("Set CLOUD_BASE_URL to an HTTP(S) API base and CLOUD_MODEL to its model ID.");
     }
@@ -78,8 +82,8 @@ Reply call_cloud(std::string base, const std::string& model, const std::string& 
     curl_easy_setopt(curl.get(), CURLOPT_HTTPHEADER, headers.get());
     curl_easy_setopt(curl.get(), CURLOPT_POSTFIELDS, payload.c_str());
     curl_easy_setopt(curl.get(), CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(payload.size()));
-    curl_easy_setopt(curl.get(), CURLOPT_CONNECTTIMEOUT, 10L);
-    curl_easy_setopt(curl.get(), CURLOPT_TIMEOUT, 90L);
+    curl_easy_setopt(curl.get(), CURLOPT_CONNECTTIMEOUT_MS, std::min(10000L, timeout_ms));
+    curl_easy_setopt(curl.get(), CURLOPT_TIMEOUT_MS, timeout_ms);
     curl_easy_setopt(curl.get(), CURLOPT_WRITEFUNCTION, append_response);
     curl_easy_setopt(curl.get(), CURLOPT_WRITEDATA, &reply.body);
     const auto result = curl_easy_perform(curl.get());
@@ -101,10 +105,22 @@ struct Arguments {
     std::string prompt;
     std::filesystem::path model_directory;
     int max_tokens = 64;
+    long cloud_timeout_ms = 90000;
+    std::chrono::milliseconds cloud_cooldown{0};
     bool demo = false;
     bool offline = false;
     bool batch = false;
 };
+
+int positive_integer(std::string_view option, const std::string& value, int limit) {
+    int result = 0;
+    const auto end = value.data() + value.size();
+    const auto [parsed, error] = std::from_chars(value.data(), end, result);
+    if (error != std::errc{} || parsed != end || result < 1 || result > limit) {
+        throw std::runtime_error(std::string(option) + " must be an integer from 1 to " + std::to_string(limit) + ".");
+    }
+    return result;
+}
 
 Arguments arguments(int argc, char** argv) {
     Arguments args;
@@ -116,7 +132,8 @@ Arguments arguments(int argc, char** argv) {
             args.offline = true;
         } else if (arg == "--batch") {
             args.batch = true;
-        } else if (arg == "--prompt" || arg == "--model" || arg == "--max-tokens") {
+        } else if (arg == "--prompt" || arg == "--model" || arg == "--max-tokens"
+                   || arg == "--cloud-timeout-ms" || arg == "--cloud-cooldown-ms") {
             if (++i >= argc) {
                 throw std::runtime_error("Missing value for " + std::string(arg));
             }
@@ -125,12 +142,12 @@ Arguments arguments(int argc, char** argv) {
                 args.prompt = value;
             } else if (arg == "--model") {
                 args.model_directory = value;
+            } else if (arg == "--max-tokens") {
+                args.max_tokens = positive_integer(arg, value, 1024);
+            } else if (arg == "--cloud-timeout-ms") {
+                args.cloud_timeout_ms = positive_integer(arg, value, 600000);
             } else {
-                std::size_t consumed = 0;
-                args.max_tokens = std::stoi(value, &consumed);
-                if (consumed != value.size() || args.max_tokens < 1 || args.max_tokens > 1024) {
-                    throw std::runtime_error("--max-tokens must be an integer from 1 to 1024.");
-                }
+                args.cloud_cooldown = std::chrono::milliseconds(positive_integer(arg, value, 600000));
             }
         } else {
             throw std::runtime_error("Unknown argument: " + std::string(arg));
@@ -148,19 +165,34 @@ Arguments arguments(int argc, char** argv) {
     if ((args.offline && !args.demo) && args.model_directory.empty()) {
         throw std::runtime_error("--offline requires --model DIR.");
     }
+    if (args.cloud_cooldown.count() > 0
+        && (!args.batch || args.demo || args.offline || args.model_directory.empty())) {
+        throw std::runtime_error("--cloud-cooldown-ms requires cloud-first --batch with --model DIR.");
+    }
     return args;
 }
 class Session {
 public:
-    explicit Session(const Arguments& args) : args_(args) {}
+    explicit Session(const Arguments& args) : args_(args), circuit_(args.cloud_cooldown) {}
 
     Json generate(const std::string& prompt, int max_tokens) {
         if (prompt.empty()) throw std::runtime_error("prompt must be a nonempty string");
-        const auto reply = args_.demo || args_.offline
-            ? Reply{503, {}}
-            : call_cloud(environment("CLOUD_BASE_URL"), environment("CLOUD_MODEL"), prompt, max_tokens);
-        if (reply.status != 503) {
-            return {{"source", "cloud"}, {"text", completion(reply)}};
+        std::optional<long> cloud_status;
+        std::string_view fallback = args_.offline ? "offline" : "demo";
+        if (args_.demo && !args_.offline) cloud_status = 503;
+        if (!args_.demo && !args_.offline) {
+            if (circuit_.bypass(CloudCircuit::Clock::now())) {
+                fallback = "circuit_open";
+            } else {
+                const auto reply = call_cloud(environment("CLOUD_BASE_URL"), environment("CLOUD_MODEL"),
+                                              prompt, max_tokens, args_.cloud_timeout_ms);
+                circuit_.observe(reply.status, CloudCircuit::Clock::now());
+                if (reply.status != 503) {
+                    return {{"source", "cloud"}, {"text", completion(reply)}};
+                }
+                cloud_status = reply.status;
+                fallback = "cloud_503";
+            }
         }
         if (args_.demo && args_.model_directory.empty()) {
             return {
@@ -183,7 +215,8 @@ public:
         auto result = local_->generate(prompt, max_tokens);
         return {
             {"source", "mlx"},
-            {"cloud_status", args_.offline ? Json(nullptr) : Json(503)},
+            {"cloud_status", cloud_status ? Json(*cloud_status) : Json(nullptr)},
+            {"fallback_reason", fallback},
             {"text", std::move(result.text)},
             {"local_metrics", {
                 {"model_reused", reused}, {"load_ms", load_ms}, {"prefill_ms", result.prefill_ms},
@@ -198,6 +231,7 @@ public:
 
 private:
     const Arguments& args_;
+    CloudCircuit circuit_;
 #ifdef EDGE_HAS_MLX
     std::unique_ptr<LocalModel> local_;
 #endif
@@ -242,7 +276,8 @@ Json process_batch_line(const BatchLine& line, Session& session, int default_tok
 int main(int argc, char** argv) {
     try {
         if (argc == 1 || (argc == 2 && std::string_view(argv[1]) == "--help")) {
-            std::cout << "edge_fallback [--demo | --offline] [--prompt TEXT | --batch] [--model DIR] [--max-tokens N]\n";
+            std::cout << "edge_fallback [--demo | --offline] [--prompt TEXT | --batch] [--model DIR] [--max-tokens N] "
+                         "[--cloud-timeout-ms N] [--cloud-cooldown-ms N]\n";
             return 0;
         }
         const auto args = arguments(argc, argv);

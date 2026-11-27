@@ -47,6 +47,26 @@ In a loopback HTTP 503 run on Apple Silicon, the first request returned `4` afte
 
 References: [MLX C++ build guide](https://github.com/ml-explore/mlx/blob/main/docs/src/dev/mlx_in_cpp.rst) and [Qwen2.5 architecture configuration](https://huggingface.co/Qwen/Qwen2.5-3B-Instruct/blob/main/config.json).
 
+## Back off during a cloud outage
+
+Run cloud-first batch mode with a local model and a cooldown.
+
+```sh
+./build-mlx/edge_fallback --batch --model /path/to/checkpoint \
+  --cloud-cooldown-ms 10000 --cloud-timeout-ms 1500
+```
+
+After an HTTP 503, the batch routes requests straight to MLX for ten seconds
+in this example. The interval starts when the 503 arrives. After it expires,
+the next request tries the cloud again. Another 503 starts a new interval.
+Local responses record `fallback_reason: "cloud_503"` for the initial
+response and `fallback_reason: "circuit_open"` with a null `cloud_status`
+for requests that skipped the cloud.
+
+The circuit starts closed and is disabled unless a cooldown is supplied.
+HTTP 429, other error statuses, and ambiguous transport failures remain
+visible as errors. The default cloud request deadline is 90 seconds.
+
 ## Tests
 
 The default build tests the CLI against a local HTTP server. It covers cloud

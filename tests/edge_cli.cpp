@@ -1,3 +1,5 @@
+#include "../src/cloud_circuit.hpp"
+
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -138,6 +140,11 @@ void test_arguments_and_batch(const Cli& cli, bool mlx) {
     rejects(cli, {"--max-tokens", "1x"}, "must be an integer");
     rejects(cli, {"--max-tokens", "0"}, "must be an integer");
     rejects(cli, {"--max-tokens", "1025"}, "must be an integer");
+    rejects(cli, {"--batch", "--cloud-timeout-ms", "-1"}, "must be an integer");
+    rejects(cli, {"--batch", "--cloud-cooldown-ms", "600001"}, "must be an integer");
+    rejects(cli, {"--batch", "--cloud-cooldown-ms", "5"}, "requires cloud-first --batch with --model");
+    rejects(cli, {"--demo", "--batch", "--model", "missing", "--cloud-cooldown-ms", "5"},
+            "requires cloud-first --batch with --model");
     rejects(cli, {"--prompt", "x"}, "Set CLOUD_BASE_URL");
     if (!mlx) rejects(cli, {"--offline", "--model", "missing", "--prompt", "x"}, "EDGE_ENABLE_MLX");
     const auto demo = cli.run({"--demo"});
@@ -171,6 +178,13 @@ public:
     }
 
     std::string url() const { return "http://127.0.0.1:" + std::to_string(ntohs(address_.sin_port)) + "/v1//"; }
+
+    bool has_pending_request() const {
+        pollfd listener{socket_.get(), POLLIN, 0};
+        const int result = poll(&listener, 1, 0);
+        require(result >= 0, "testing for unexpected connections failed");
+        return result > 0;
+    }
 
     void exchange(std::string_view prompt, int tokens, std::string_view status, const std::string& content,
                   int wait_ms = 8000) {
@@ -223,7 +237,27 @@ void point_at(const Server& server) {
     setenv("no_proxy", "127.0.0.1", 1);
 }
 
+void test_circuit_clock() {
+    using namespace std::chrono_literals;
+    const CloudCircuit::Clock::time_point start{};
+    CloudCircuit circuit(100ms);
+    require(!circuit.bypass(start), "fresh circuit bypassed");
+    circuit.observe(429, start);
+    require(!circuit.bypass(start), "rate limit opened the circuit");
+    circuit.observe(503, start);
+    require(circuit.bypass(start + 99ms), "circuit closed before the deadline");
+    require(!circuit.bypass(start + 100ms), "probe blocked at the deadline");
+    circuit.observe(503, start + 100ms);
+    require(circuit.bypass(start + 199ms), "failed probe did not reopen the circuit");
+    circuit.observe(200, start + 200ms);
+    require(!circuit.bypass(start + 200ms), "successful probe did not clear the circuit");
+    CloudCircuit disabled(0ms);
+    disabled.observe(503, start);
+    require(!disabled.bypass(start), "default settings opened a circuit");
+}
+
 void test_cloud(const Cli& cli) {
+    test_circuit_clock();
     Server server;
     point_at(server);
     const auto pid = cli.start({"--batch", "--max-tokens", "16"},
@@ -305,21 +339,29 @@ void test_dense_checkpoint(const Cli& cli) {
 }
 #endif
 
-void test_mlx(const Cli& cli, const std::string& model) {
+void test_mlx(const Cli& cli, const std::string& model, bool cooldown) {
     const std::string first = "Reply with just the number. What is 2 plus 2?";
     const std::string second = "Reply with just the number. What is 3 plus 3?";
     Server server;
     point_at(server);
     const auto request = [](const std::string& text) { return Json{{"prompt", text}}.dump() + "\n"; };
-    const auto pid = cli.start({"--batch", "--model", model, "--max-tokens", "8"},
-                               request(first) + "malformed\n" + request(second));
+    std::vector<std::string> args{"--batch", "--model", model, "--max-tokens", "8"};
+    if (cooldown) {
+        args.insert(args.end(), {"--cloud-cooldown-ms", "600000"});
+        const auto probe = cli.run(args, "");
+        require(probe.code == 0, "cooldown flag rejected: " + probe.error);
+    }
+    const auto pid = cli.start(std::move(args), request(first) + "malformed\n" + request(second));
     server.exchange(first, 8, "503 Service Unavailable", "{}");
-    server.exchange(second, 8, "503 Service Unavailable", "{}", 60000);
+    if (!cooldown) server.exchange(second, 8, "503 Service Unavailable", "{}", 60000);
     const auto rows = batch(cli.finish(pid), 3);
     for (const std::size_t i : {0, 2}) {
         const auto& row = rows[i];
         const auto& metrics = row.at("local_metrics");
-        require(row.at("source") == "mlx" && row.at("cloud_status") == 503 && row.at("ok") == true, row.dump());
+        const bool skipped = cooldown && i == 2;
+        require(row.at("source") == "mlx" && row.at("ok") == true, row.dump());
+        require(skipped ? row.at("cloud_status").is_null() : row.at("cloud_status") == 503, row.dump());
+        require(row.at("fallback_reason") == (skipped ? "circuit_open" : "cloud_503"), row.dump());
         require(metrics.at("model_reused") == (i == 2) && metrics.at("generated_tokens").get<int>() > 0,
                 row.dump());
         require(i == 0 ? metrics.at("load_ms").get<double>() > 0.0 : metrics.at("load_ms") == 0.0, row.dump());
@@ -327,6 +369,7 @@ void test_mlx(const Cli& cli, const std::string& model) {
     require(rows[0].at("text").get<std::string>().find('4') != std::string::npos, rows[0].dump());
     require(rows[1].at("ok") == false, rows[1].dump());
     require(rows[2].at("text").get<std::string>().find('6') != std::string::npos, rows[2].dump());
+    require(!server.has_pending_request(), "the skipped request reached the cloud server");
     const auto offline = batch(cli.run({"--batch", "--offline", "--model", model, "--max-tokens", "1"},
                                    request(first) + request("<|reserved|>")), 2);
     require(offline[0].at("source") == "mlx" && offline[0].at("cloud_status").is_null()
@@ -343,9 +386,9 @@ int main(int argc, char** argv) try {
     unsetenv("CLOUD_API_KEY");
     const Cli cli(argv[1]);
     const std::string_view mode = argv[2];
-    if (mode == "mlx") {
+    if (mode == "mlx" || mode == "mlx-cooldown") {
         require(argc == 4, "missing test model");
-        test_mlx(cli, argv[3]);
+        test_mlx(cli, argv[3], mode == "mlx-cooldown");
 #ifdef EDGE_TEST_MLX
     } else if (mode == "dense") {
         test_dense_checkpoint(cli);
