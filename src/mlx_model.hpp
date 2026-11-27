@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -18,6 +19,11 @@ struct LocalGeneration {
     std::size_t retained_prefix_bytes;
     double prefill_ms;
     double generation_ms;
+    std::optional<double> ttft_ms;
+    std::optional<double> decode_ms;
+    std::optional<double> decode_tokens_per_second;
+    std::optional<double> stop_decision_ms;
+    bool stopped_on_token;
 };
 
 // Sequential runner. Each generation owns its KV cache.

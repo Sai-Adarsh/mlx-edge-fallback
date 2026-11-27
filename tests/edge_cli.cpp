@@ -12,6 +12,7 @@
 #include <nlohmann/json.hpp>
 
 #include <cerrno>
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -25,7 +26,7 @@ namespace fs = std::filesystem;
 using Json = nlohmann::json;
 
 #ifdef EDGE_TEST_MLX
-void write_mlx_fixture(const fs::path& directory, bool include_head = true);
+void write_mlx_fixture(const fs::path& directory, bool include_head = true, bool stop_after_two = false);
 #endif
 
 namespace {
@@ -295,6 +296,37 @@ void test_dense_checkpoint(const Cli& cli) {
             rows[1].dump());
     require(rows[2].at("local_metrics").at("generated_tokens") == 1, rows[2].dump());
 
+    const auto check_decode = [](const Json& row, std::size_t emitted, std::string_view stop) {
+        const auto& metrics = row.at("local_metrics");
+        require(metrics.at("generated_tokens") == emitted && metrics.at("stop_reason") == stop, row.dump());
+        const auto ttft = metrics.at("ttft_ms").get<double>();
+        const auto tail = metrics.at("decode_ms").get<double>();
+        const auto rate = metrics.at("decode_tokens_per_second").get<double>();
+        require(ttft == metrics.at("prefill_ms").get<double>() && tail > 0 &&
+                std::abs(tail * rate - (emitted - 1) * 1000.0) < 1e-6, row.dump());
+        const auto& eos = metrics.at("stop_decision_ms");
+        if (stop == "stop_token") {
+            require(eos.get<double>() > 0, row.dump());
+        } else {
+            require(eos.is_null(), row.dump());
+        }
+        require(ttft + tail + (eos.is_null() ? 0 : eos.get<double>()) <=
+                metrics.at("generation_ms").get<double>() + 1e-6, row.dump());
+    };
+    check_decode(rows[1], 3, "token_limit");
+    const auto& single = rows[2].at("local_metrics");
+    require(single.at("ttft_ms").is_number() && single.at("decode_ms").is_null() &&
+            single.at("decode_tokens_per_second").is_null() && single.at("stop_reason") == "token_limit",
+            rows[2].dump());
+
+    const auto stopping_model = scratch.path / "stopping";
+    write_mlx_fixture(stopping_model, true, true);
+    const auto stopped_after_two = batch(cli.run(
+        {"--batch", "--offline", "--model", stopping_model.string(), "--max-tokens", "5", "--trace-token-ids"},
+        R"({"prompt":"hello "})"), 1).front();
+    require(stopped_after_two.at("generated_token_ids") == Json::array({1, 2}), stopped_after_two.dump());
+    check_decode(stopped_after_two, 2, "stop_token");
+
     auto prefix_args = args;
     const auto prompt_size = rows[2].at("local_metrics").at("prompt_tokens").get<int>();
     prefix_args.insert(prefix_args.end(), {"--prefix-cache-tokens", std::to_string(prompt_size - 1),
@@ -327,6 +359,10 @@ void test_dense_checkpoint(const Cli& cli) {
     std::ofstream(config_path) << config.dump();
     const auto stopped = batch(cli.run(args, request), 1).front();
     require(stopped.at("text") == "" && stopped.at("local_metrics").at("generated_tokens") == 0, stopped.dump());
+    const auto& no_content = stopped.at("local_metrics");
+    require(no_content.at("ttft_ms").is_null() && no_content.at("decode_ms").is_null() &&
+            no_content.at("decode_tokens_per_second").is_null() && no_content.at("stop_decision_ms").is_null() &&
+            no_content.at("stop_reason") == "stop_token", stopped.dump());
 
     config["model_type"] = "unknown";
     std::ofstream(config_path) << config.dump();
