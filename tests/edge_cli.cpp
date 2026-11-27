@@ -189,8 +189,11 @@ public:
         return result > 0;
     }
 
+    enum class Headers { complete, incomplete };
+
     void exchange(std::string_view prompt, int tokens, std::string_view status, const std::string& content,
-                  int wait_ms = 8000, std::size_t missing_bytes = 0, bool wait_for_close = false) {
+                  int wait_ms = 8000, std::size_t missing_bytes = 0, bool wait_for_close = false,
+                  Headers headers = Headers::complete) {
         pollfd listener{socket_.get(), POLLIN, 0};
         require(poll(&listener, 1, wait_ms) == 1, "edge CLI did not connect");
         Socket connection(accept(socket_.get(), nullptr, nullptr));
@@ -220,8 +223,9 @@ public:
         require(payload.at("model") == "test-model" && payload.at("stream") == false
                 && payload.at("max_tokens") == tokens
                 && payload.at("messages").at(0).at("content") == prompt, "unexpected request " + payload.dump());
-        const auto response = "HTTP/1.1 " + std::string(status) + "\r\nContent-Type: application/json\r\n"
-            "Connection: close\r\nContent-Length: " + std::to_string(content.size() + missing_bytes) + "\r\n\r\n" + content;
+        auto response = "HTTP/1.1 " + std::string(status) + "\r\nContent-Type: application/json\r\n"
+            "Connection: close\r\nContent-Length: " + std::to_string(content.size() + missing_bytes) + "\r\n";
+        if (headers == Headers::complete) response += "\r\n" + content;
         std::size_t sent = 0;
         while (sent < response.size()) {
             const auto count = send(connection.get(), response.data() + sent, response.size() - sent, 0);
@@ -231,7 +235,7 @@ public:
         }
         if (wait_for_close) {
             pollfd peer{connection.get(), POLLIN, 0};
-            require(poll(&peer, 1, wait_ms) == 1, "edge CLI waited for an unavailable response body");
+            require(poll(&peer, 1, wait_ms) == 1, "edge CLI waited too long for the stalled response");
             char byte;
             require(recv(connection.get(), &byte, 1, 0) == 0, "edge CLI did not close the stalled response");
         }
@@ -293,6 +297,18 @@ void test_cloud(const Cli& cli) {
     require(rows[6].at("error").get<std::string>().starts_with("Cloud request failed:"), rows[6].dump());
     require(rows[7].at("error").get<std::string>().find("Pass --model") != std::string::npos, rows[7].dump());
     require(rows[8].at("source") == "cloud" && rows[8].at("text") == "recovered", rows[8].dump());
+
+    const auto incomplete_pid = cli.start({"--batch", "--max-tokens", "16", "--cloud-timeout-ms", "2000"},
+        "{\"prompt\":\"stalled headers\"}\n{\"prompt\":\"closed headers\"}\n{\"prompt\":\"after incomplete headers\"}\n");
+    server.exchange("stalled headers", 16, "503 Service Unavailable", "", 5000, 1, true,
+                    Server::Headers::incomplete);
+    server.exchange("closed headers", 16, "503 Service Unavailable", "", 5000, 1, false,
+                    Server::Headers::incomplete);
+    server.exchange("after incomplete headers", 16, "200 OK", R"({"choices":[{"message":{"content":"upstream"}}]})");
+    const auto incomplete = batch(cli.finish(incomplete_pid), 3);
+    require(incomplete[0].at("error").get<std::string>().starts_with("Cloud request failed:"), incomplete[0].dump());
+    require(incomplete[1].at("error").get<std::string>().starts_with("Cloud request failed:"), incomplete[1].dump());
+    require(incomplete[2].at("source") == "cloud" && incomplete[2].at("text") == "upstream", incomplete[2].dump());
 }
 
 #ifdef EDGE_TEST_MLX
@@ -304,6 +320,24 @@ void test_dense_checkpoint(const Cli& cli) {
     const auto config_path = model / "config.json";
     const auto weights = model / "model.safetensors";
     write_mlx_fixture(model);
+
+    Server server;
+    point_at(server);
+    const auto fallback_pid = cli.start(
+        {"--batch", "--model", model.string(), "--max-tokens", "1", "--cloud-timeout-ms", "2000",
+         "--cloud-cooldown-ms", "60000"},
+        "{\"prompt\":\"incomplete\"}\n{\"prompt\":\"confirmed\"}\n{\"prompt\":\"during cooldown\"}\n");
+    server.exchange("incomplete", 1, "503 Service Unavailable", "", 5000, 1, true, Server::Headers::incomplete);
+    server.exchange("confirmed", 1, "503 Service Unavailable", "", 5000, 1, true);
+    const auto fallback = batch(cli.finish(fallback_pid), 3);
+    require(fallback[0].at("error").get<std::string>().starts_with("Cloud request failed:"), fallback[0].dump());
+    require(fallback[1].at("source") == "mlx" && fallback[1].at("cloud_status") == 503 &&
+            fallback[1].at("fallback_reason") == "cloud_503" && fallback[1].at("text") == "yes" &&
+            fallback[1].at("local_metrics").at("model_reused") == false, fallback[1].dump());
+    require(fallback[2].at("source") == "mlx" && fallback[2].at("cloud_status").is_null() &&
+            fallback[2].at("fallback_reason") == "circuit_open" && fallback[2].at("text") == "yes" &&
+            fallback[2].at("local_metrics").at("model_reused") == true, fallback[2].dump());
+
     const auto rows = batch(cli.run(args, R"({"prompt":"hello","max_tokens":20}
 {"prompt":"hello"}
 {"prompt":"hello","max_tokens":1})"), 3);
