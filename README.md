@@ -159,6 +159,33 @@ faster to the first token in every measured pair. Decode rates varied
 widely across processes, and the medians moved in different directions.
 [Raw timing pairs](evidence/llama-3b-long-decode.csv) · [Environment and checksums](evidence/llama-3b-long-decode-environment.txt)
 
+### Decode cache allocation
+
+The saved 2,700-token pairs show a large request-order effect. With the
+2,700-token prompt first, both modes decoded at 15.91–29.97 tok/s. With it
+after the 4,620-token prompt, both modes fell to 3.74–9.15 tok/s. Three of
+four paired rate ratios also favored cache-off. The run does not isolate
+the effect of the retained prefix from process state.
+
+Both modes previously concatenated their full live KV arrays at each
+decode step. Decode now reserves up to 64 positions at a time within the
+request's budget, updates the new slice, and passes only live positions
+to attention. The saved prefix stays separate from this request buffer.
+
+A model-free Metal probe appended 12 BF16 slices to one 2,700-position
+tensor with eight KV heads of width 128 on MLX 0.32.5. After each trial,
+MLX's allocator retained 22,167,556 bytes with concatenation and
+11,124,742 bytes with reservation. The median elapsed times were 4.55
+and 4.42 ms respectively across six trials per method, with overlapping
+ranges. Most updates still used a different buffer. The probe measures
+allocator retention in its own process and does not measure full-model
+decode throughput. [Raw probe samples](evidence/mlx-decode-kv-append.csv)
+
+```sh
+cmake --build build-mlx --target edge_kv_cache_test --parallel 1
+./build-mlx/edge_kv_cache_test --probe
+```
+
 ## Tests
 
 The default build tests the CLI against a local HTTP server. It covers cloud
