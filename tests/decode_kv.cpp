@@ -26,13 +26,13 @@ void check_isolation() {
 
 void check_growth() {
     auto storage = mx::ones({1, 2, 3, 4});
-    const auto fill = mx::full({1, 2, 64, 4}, 2, mx::float32);
+    const auto fill = mx::full({1, 2, 63, 4}, 2, mx::float32);
     const auto first = edge::append_decode_kv(storage, fill, 3, 70);
-    if (storage.shape(2) != 67 || first.shape(2) != 67) {
+    if (storage.shape(2) != 67 || first.shape(2) != 66) {
         throw std::runtime_error("decode block did not reserve the expected capacity");
     }
-    const auto last = mx::full({1, 2, 1, 4}, 3, mx::float32);
-    const auto live = edge::append_decode_kv(storage, last, 67, 70);
+    const auto last = mx::full({1, 2, 2, 4}, 3, mx::float32);
+    const auto live = edge::append_decode_kv(storage, last, 66, 70);
     const auto expected = mx::concatenate({mx::ones({1, 2, 3, 4}), fill, last}, 2);
     if (storage.shape(2) != 70 || live.shape(2) != 68 || !mx::array_equal(live, expected).item<bool>()) {
         throw std::runtime_error("growing the decode block lost values or exceeded its limit");
@@ -66,10 +66,11 @@ void probe(bool reserved) {
 }
 
 int main(int argc, char** argv) try {
-    mx::set_default_device(mx::Device::gpu);
+    const std::string_view mode = argc == 2 ? argv[1] : "";
+    mx::set_default_device(mode == "--cpu" ? mx::Device::cpu : mx::Device::gpu);
     check_isolation();
     check_growth();
-    if (argc == 2 && std::string_view(argv[1]) == "--probe") {
+    if (mode == "--probe") {
         // Warm both paths, then alternate order. One BF16 tensor, no model load.
         probe(false);
         probe(true);
