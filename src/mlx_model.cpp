@@ -1,4 +1,5 @@
 #include "mlx_model.hpp"
+#include "decode_kv.hpp"
 
 #include <mlx/mlx.h>
 #include <nlohmann/json.hpp>
@@ -153,6 +154,7 @@ class Decoder {
     LayerCaches cache_;
     const std::optional<mx::array>& rope_periods_;
     int offset_ = 0;
+    int decode_capacity_ = 0;
 
     const mx::array& weight(const std::string& name) const {
         const auto item = weights_.find(name);
@@ -200,11 +202,17 @@ class Decoder {
         auto queries = rope(split_heads(".q_proj", config_.heads));
         auto keys = rope(split_heads(".k_proj", config_.kv_heads));
         auto values = split_heads(".v_proj", config_.kv_heads);
-        if (cache_[layer]) {
-            keys = mx::concatenate({cache_[layer]->keys, keys}, 2);
-            values = mx::concatenate({cache_[layer]->values, values}, 2);
+        if (decode_capacity_ > 0) {
+            auto& layer_cache = *cache_[layer];
+            keys = edge::append_decode_kv(layer_cache.keys, keys, offset_, decode_capacity_);
+            values = edge::append_decode_kv(layer_cache.values, values, offset_, decode_capacity_);
+        } else {
+            if (cache_[layer]) {
+                keys = mx::concatenate({cache_[layer]->keys, keys}, 2);
+                values = mx::concatenate({cache_[layer]->values, values}, 2);
+            }
+            cache_[layer] = Cache{keys, values};
         }
-        cache_[layer] = Cache{keys, values};
         // MLX aligns the last query with the last key for cached multi-token suffixes.
         auto attention = mx::fast::scaled_dot_product_attention(
             queries, keys, values, 1.0f / std::sqrt(static_cast<float>(head_size)), -1,
@@ -252,6 +260,8 @@ public:
         cache_ = prefix.layers;
         offset_ = static_cast<int>(prefix.tokens.size());
     }
+
+    void reserve_decode(int capacity) { decode_capacity_ = capacity; }
 
     std::int32_t next_token(std::span<const std::int32_t> tokens) {
         const auto hidden = forward(tokens);
@@ -349,6 +359,7 @@ LocalGeneration LocalModel::generate(const std::string& prompt, int max_tokens) 
     generated.reserve(max_tokens);
     auto next = decoder.next_token(suffix);
     const auto first_decision = Clock::now();
+    decoder.reserve_decode(static_cast<int>(prompt_tokens.size()) + max_tokens - 1);
     auto decision = first_decision;
     auto last_output = first_decision;
     while (std::find(model.stop_ids.begin(), model.stop_ids.end(), next) == model.stop_ids.end()) {

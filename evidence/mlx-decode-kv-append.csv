@@ -1,0 +1,13 @@
+strategy,elapsed_ms,same_buffer_steps,allocator_cached_bytes
+reserved,4.45317,1/12,11124742
+concatenate,5.05708,0/12,22167556
+concatenate,4.70908,0/12,22167556
+reserved,5.15021,0/12,11124742
+reserved,4.38792,0/12,11124742
+concatenate,4.56892,0/12,22167556
+concatenate,4.52192,0/12,22167556
+reserved,4.52217,1/12,11124742
+reserved,4.04633,0/12,11124742
+concatenate,4.4,0/12,22167556
+concatenate,3.58192,0/12,22167556
+reserved,3.43317,0/12,11124742
