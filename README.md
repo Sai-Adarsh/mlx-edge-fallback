@@ -46,3 +46,36 @@ The first local request loads the tokenizer and materializes the weights. Each r
 In a loopback HTTP 503 run on Apple Silicon, the first request returned `4` after loading the model in about 1,085 ms. An invalid input line produced an error. The next request returned `6` using the resident weights and reported zero load time.
 
 References: [MLX C++ build guide](https://github.com/ml-explore/mlx/blob/main/docs/src/dev/mlx_in_cpp.rst) and [Qwen2.5 architecture configuration](https://huggingface.co/Qwen/Qwen2.5-3B-Instruct/blob/main/config.json).
+
+## Tests
+
+The default build tests the CLI against a local HTTP server. It covers cloud
+success, fallback selection, malformed and oversized replies, and JSONL
+recovery after an invalid request.
+
+```sh
+cmake -S . -B build
+cmake --build build --parallel
+ctest --test-dir build --output-on-failure
+```
+
+An MLX build also tests a deterministic, generated Qwen2-style checkpoint on
+Metal. The test checks dense attention, output token limits, EOS and context
+handling, and invalid checkpoint files. For the cached 4-bit Llama 3.2 3B
+integration test, configure `build-mlx` with
+`-DEDGE_TEST_MODEL=/path/to/Llama-3.2-3B-Instruct-4bit`.
+Run `ctest --test-dir build-mlx --output-on-failure` to include the real
+checkpoint. A local server supplies the HTTP 503 responses.
+
+To measure the application and MLX code, configure each build separately
+with Clang and `-DCMAKE_CXX_FLAGS="-fprofile-instr-generate -fcoverage-mapping"`.
+Run these commands in the source directory with a fresh instrumented build.
+
+```sh
+build_dir=build  # Use build-mlx for the Metal configuration.
+LLVM_PROFILE_FILE="$PWD/$build_dir/%p-%m.profraw" \
+  ctest --test-dir "$build_dir" --output-on-failure
+llvm-profdata merge -sparse "$build_dir"/*.profraw -o "$build_dir/run.profdata"
+llvm-cov report "$build_dir/edge_fallback" \
+  -instr-profile "$build_dir/run.profdata" "$PWD/src"
+```
