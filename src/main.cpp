@@ -87,10 +87,11 @@ Reply call_cloud(std::string base, const std::string& model, const std::string& 
     curl_easy_setopt(curl.get(), CURLOPT_WRITEFUNCTION, append_response);
     curl_easy_setopt(curl.get(), CURLOPT_WRITEDATA, &reply.body);
     const auto result = curl_easy_perform(curl.get());
-    if (result != CURLE_OK) {
+    curl_easy_getinfo(curl.get(), CURLINFO_RESPONSE_CODE, &reply.status);
+    // A final 503 is sufficient to switch models even if its error body breaks.
+    if (result != CURLE_OK && reply.status != 503) {
         throw std::runtime_error(std::string("Cloud request failed: ") + curl_easy_strerror(result));
     }
-    curl_easy_getinfo(curl.get(), CURLINFO_RESPONSE_CODE, &reply.status);
     return reply;
 }
 

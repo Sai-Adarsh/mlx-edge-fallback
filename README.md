@@ -58,7 +58,7 @@ Run cloud-first batch mode with a local model and a cooldown.
 
 After an HTTP 503, the batch routes requests straight to MLX for ten seconds
 in this example. The interval starts when the 503 arrives. After it expires,
-the next request tries the cloud again. Another 503 starts a new interval.
+the next request tries the cloud again. Another 503 starts a new interval. The final 503 status is sufficient even if its body is truncated.
 Local responses record `fallback_reason: "cloud_503"` for the initial
 response and `fallback_reason: "circuit_open"` with a null `cloud_status`
 for requests that skipped the cloud.

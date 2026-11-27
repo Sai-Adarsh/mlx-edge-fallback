@@ -187,7 +187,7 @@ public:
     }
 
     void exchange(std::string_view prompt, int tokens, std::string_view status, const std::string& content,
-                  int wait_ms = 8000) {
+                  int wait_ms = 8000, std::size_t missing_bytes = 0) {
         pollfd listener{socket_.get(), POLLIN, 0};
         require(poll(&listener, 1, wait_ms) == 1, "edge CLI did not connect");
         Socket connection(accept(socket_.get(), nullptr, nullptr));
@@ -218,7 +218,7 @@ public:
                 && payload.at("max_tokens") == tokens
                 && payload.at("messages").at(0).at("content") == prompt, "unexpected request " + payload.dump());
         const auto response = "HTTP/1.1 " + std::string(status) + "\r\nContent-Type: application/json\r\n"
-            "Connection: close\r\nContent-Length: " + std::to_string(content.size()) + "\r\n\r\n" + content;
+            "Connection: close\r\nContent-Length: " + std::to_string(content.size() + missing_bytes) + "\r\n\r\n" + content;
         std::size_t sent = 0;
         while (sent < response.size()) {
             const auto count = send(connection.get(), response.data() + sent, response.size() - sent, 0);
@@ -347,12 +347,12 @@ void test_mlx(const Cli& cli, const std::string& model, bool cooldown) {
     const auto request = [](const std::string& text) { return Json{{"prompt", text}}.dump() + "\n"; };
     std::vector<std::string> args{"--batch", "--model", model, "--max-tokens", "8"};
     if (cooldown) {
-        args.insert(args.end(), {"--cloud-cooldown-ms", "600000"});
+        args.insert(args.end(), {"--cloud-cooldown-ms", "600000", "--cloud-timeout-ms", "2000"});
         const auto probe = cli.run(args, "");
         require(probe.code == 0, "cooldown flag rejected: " + probe.error);
     }
     const auto pid = cli.start(std::move(args), request(first) + "malformed\n" + request(second));
-    server.exchange(first, 8, "503 Service Unavailable", "{}");
+    server.exchange(first, 8, "503 Service Unavailable", "{}", 8000, cooldown ? 1 : 0);
     if (!cooldown) server.exchange(second, 8, "503 Service Unavailable", "{}", 60000);
     const auto rows = batch(cli.finish(pid), 3);
     for (const std::size_t i : {0, 2}) {
