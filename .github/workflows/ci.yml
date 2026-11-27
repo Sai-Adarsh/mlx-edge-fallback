@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  portable:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install libcurl development headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcurl4-openssl-dev
+      - name: Configure and build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_IGNORE_PREFIX_PATH=/usr/local
+          cmake --build build --parallel 2
+      - name: Test portable CLI
+        run: ctest --test-dir build --output-on-failure --no-tests=error
+
+  apple-silicon:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install MLX and tokenizers-cpp
+        run: |
+          python3 -m pip install --target "$RUNNER_TEMP/mlx" --no-deps --only-binary=:all: mlx-metal==0.32.5
+          git clone --branch v0.1.1 --depth 1 --recurse-submodules --shallow-submodules \
+            https://github.com/mlc-ai/tokenizers-cpp.git "$RUNNER_TEMP/tokenizers-cpp"
+      - name: Configure and build the MLX backend
+        run: |
+          cmake -S . -B build-mlx -DCMAKE_BUILD_TYPE=Release -DEDGE_ENABLE_MLX=ON \
+            -DMLX_DIR="$RUNNER_TEMP/mlx/mlx/share/cmake/MLX" \
+            -DTOKENIZERS_CPP_SOURCE="$RUNNER_TEMP/tokenizers-cpp"
+          cmake --build build-mlx --parallel 2
+      - name: Test CLI with the backend linked
+        run: ctest --test-dir build-mlx --output-on-failure --no-tests=error -LE metal
+      - name: Test MLX on Metal when the runner exposes a GPU
+        run: |
+          device=$(swift -e 'import Metal; print(MTLCreateSystemDefaultDevice()?.name ?? "")')
+          if [ -z "$device" ]; then
+            echo "::notice::No Metal GPU is exposed to this runner. The MLX backend built, and Metal runtime tests were skipped."
+            exit 0
+          fi
+          echo "Metal device: $device"
+          ctest --test-dir build-mlx --output-on-failure --no-tests=error -L metal
