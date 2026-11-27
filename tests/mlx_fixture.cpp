@@ -1,6 +1,7 @@
 #include <mlx/mlx.h>
 #include <nlohmann/json.hpp>
 
+#include <array>
 #include <filesystem>
 #include <fstream>
 #include <unordered_map>
@@ -9,7 +10,7 @@ namespace fs = std::filesystem;
 namespace mx = mlx::core;
 using Json = nlohmann::json;
 
-void write_mlx_fixture(const fs::path& directory, bool include_head) {
+void write_mlx_fixture(const fs::path& directory, bool include_head, bool stop_after_two) {
     fs::create_directory(directory);
     // Tiny dense Qwen2-compatible checkpoint. Zero attention and MLP residuals
     // leave unit embeddings unchanged, so the biased head always selects "yes".
@@ -47,6 +48,19 @@ void write_mlx_fixture(const fs::path& directory, bool include_head) {
         {"lm_head.weight", mx::zeros({4, 8})},
         {"lm_head.bias", mx::array({0.f, 0.f, 2.f, 0.f})},
     };
+    if (stop_after_two) {
+        // With zero attention/MLP, each one-hot embedding selects the next
+        // token: prompt terminator/unknown 0 → hello 1 → yes 2 → EOS 3.
+        std::array<float, 32> embeddings{};
+        std::array<float, 32> head{};
+        for (std::size_t token = 0; token < 4; ++token) {
+            embeddings[token * 8 + token] = 1.0f;
+            head[((token + 1) % 4) * 8 + token] = 1.0f;
+        }
+        tensors.insert_or_assign("model.embed_tokens.weight", mx::array(embeddings.begin(), {4, 8}));
+        tensors.insert_or_assign("lm_head.weight", mx::array(head.begin(), {4, 8}));
+        tensors.erase("lm_head.bias");
+    }
     if (!include_head) tensors.erase("lm_head.weight");
     mx::save_safetensors((directory / "model.safetensors").string(), tensors);
 }

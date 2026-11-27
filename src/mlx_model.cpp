@@ -348,14 +348,19 @@ LocalGeneration LocalModel::generate(const std::string& prompt, int max_tokens) 
     std::vector<std::int32_t> generated;
     generated.reserve(max_tokens);
     auto next = decoder.next_token(suffix);
-    const auto first = Clock::now();
+    const auto first_decision = Clock::now();
+    auto decision = first_decision;
+    auto last_output = first_decision;
     while (std::find(model.stop_ids.begin(), model.stop_ids.end(), next) == model.stop_ids.end()) {
         generated.push_back(next);
+        last_output = decision;
         if (generated.size() >= static_cast<std::size_t>(max_tokens)) {
             break;
         }
         next = decoder.next_token(std::span(&next, 1));
+        decision = Clock::now();
     }
+    const bool stopped_on_token = generated.size() < static_cast<std::size_t>(max_tokens);
     auto text = model.tokenizer->Decode(generated);
     // next_token synchronized the suffix and the prefix K/V it consumed. Cache
     // only the prefix, whose handles were saved before any suffix was appended.
@@ -363,8 +368,23 @@ LocalGeneration LocalModel::generate(const std::string& prompt, int max_tokens) 
     const auto milliseconds = [](auto duration) {
         return std::chrono::duration<double, std::milli>(duration).count();
     };
+    const double prefill_ms = milliseconds(first_decision - started);
+    const auto emitted = generated.size();
+    std::optional<double> ttft_ms;
+    std::optional<double> decode_ms;
+    std::optional<double> output_rate;
+    std::optional<double> stop_ms;
+    if (emitted > 0) {
+        ttft_ms = prefill_ms;
+        if (stopped_on_token) stop_ms = milliseconds(decision - last_output);
+    }
+    if (emitted > 1) {
+        decode_ms = milliseconds(last_output - first_decision);
+        if (*decode_ms > 0) output_rate = (emitted - 1) * 1000.0 / *decode_ms;
+    }
     return {std::move(text), prompt_tokens.size(), std::move(generated), reused_tokens,
             model.prefix ? model.prefix->tokens.size() : 0,
             model.prefix ? model.prefix->bytes : 0,
-            milliseconds(first - started), milliseconds(Clock::now() - started)};
+            prefill_ms, milliseconds(Clock::now() - started),
+            ttft_ms, decode_ms, output_rate, stop_ms, stopped_on_token};
 }

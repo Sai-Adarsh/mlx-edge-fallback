@@ -223,6 +223,9 @@ public:
             load_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
         }
         auto result = local_->generate(prompt, max_tokens);
+        const auto metric = [](std::optional<double> value) {
+            return value ? Json(*value) : Json(nullptr);
+        };
         Json output{
             {"source", "mlx"},
             {"cloud_status", cloud_status ? Json(*cloud_status) : Json(nullptr)},
@@ -232,6 +235,11 @@ public:
                 {"model_reused", reused}, {"load_ms", load_ms}, {"prefill_ms", result.prefill_ms},
                 {"generation_ms", result.generation_ms}, {"prompt_tokens", result.prompt_tokens},
                 {"generated_tokens", result.token_ids.size()},
+                {"ttft_ms", metric(result.ttft_ms)},
+                {"decode_ms", metric(result.decode_ms)},
+                {"decode_tokens_per_second", metric(result.decode_tokens_per_second)},
+                {"stop_decision_ms", metric(result.stop_decision_ms)},
+                {"stop_reason", result.stopped_on_token ? "stop_token" : "token_limit"},
                 {"reused_prefix_tokens", result.reused_prefix_tokens},
                 {"retained_prefix_tokens", result.retained_prefix_tokens},
                 {"retained_prefix_bytes", result.retained_prefix_bytes}

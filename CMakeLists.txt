@@ -39,7 +39,12 @@ if(EDGE_ENABLE_MLX)
 endif()
 
 include(CTest)
+option(EDGE_TEST_LONG_DECODE "Run long prompt and decode parity against EDGE_TEST_MODEL" OFF)
 set(EDGE_TEST_MODEL "" CACHE PATH "Optional mlx-community/Llama-3.2-3B-Instruct-4bit checkpoint for CTest")
+if(EDGE_TEST_LONG_DECODE AND NOT (BUILD_TESTING AND EDGE_ENABLE_MLX AND EDGE_TEST_MODEL))
+  message(FATAL_ERROR "EDGE_TEST_LONG_DECODE requires BUILD_TESTING, EDGE_ENABLE_MLX, and EDGE_TEST_MODEL.")
+endif()
+
 if(BUILD_TESTING AND UNIX)
   add_executable(edge_cli_test tests/edge_cli.cpp)
   target_link_libraries(edge_cli_test PRIVATE nlohmann_json::nlohmann_json)
@@ -61,5 +66,13 @@ if(BUILD_TESTING AND UNIX)
     add_test(NAME edge_mlx_cooldown COMMAND edge_cli_test $<TARGET_FILE:edge_fallback> mlx-cooldown "${EDGE_TEST_MODEL}")
     add_test(NAME edge_mlx_prefix COMMAND edge_cli_test $<TARGET_FILE:edge_fallback> mlx-prefix "${EDGE_TEST_MODEL}")
     set_tests_properties(edge_mlx edge_mlx_cooldown edge_mlx_prefix PROPERTIES LABELS metal TIMEOUT 120)
+    if(EDGE_TEST_LONG_DECODE)
+      find_program(EDGE_JQ jq REQUIRED)
+      add_test(NAME edge_mlx_long_decode
+        COMMAND "${CMAKE_COMMAND}" -E env "EDGE_JQ=${EDGE_JQ}"
+                sh "${CMAKE_CURRENT_SOURCE_DIR}/bench/long_decode_ab.sh"
+                $<TARGET_FILE:edge_fallback> "${EDGE_TEST_MODEL}" 1024 1)
+      set_tests_properties(edge_mlx_long_decode PROPERTIES LABELS "metal;long" TIMEOUT 180)
+    endif()
   endif()
 endif()
