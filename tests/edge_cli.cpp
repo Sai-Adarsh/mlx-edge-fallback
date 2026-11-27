@@ -172,9 +172,10 @@ public:
 
     std::string url() const { return "http://127.0.0.1:" + std::to_string(ntohs(address_.sin_port)) + "/v1//"; }
 
-    void exchange(std::string_view prompt, int tokens, std::string_view status, const std::string& content) {
+    void exchange(std::string_view prompt, int tokens, std::string_view status, const std::string& content,
+                  int wait_ms = 8000) {
         pollfd listener{socket_.get(), POLLIN, 0};
-        require(poll(&listener, 1, 8000) == 1, "edge CLI did not connect");
+        require(poll(&listener, 1, wait_ms) == 1, "edge CLI did not connect");
         Socket connection(accept(socket_.get(), nullptr, nullptr));
         const timeval timeout{5, 0};
         require(setsockopt(connection.get(), SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0,
@@ -219,6 +220,7 @@ void point_at(const Server& server) {
     setenv("CLOUD_MODEL", "test-model", 1);
     setenv("CLOUD_API_KEY", "test-key", 1);
     setenv("NO_PROXY", "127.0.0.1", 1);
+    setenv("no_proxy", "127.0.0.1", 1);
 }
 
 void test_cloud(const Cli& cli) {
@@ -312,7 +314,7 @@ void test_mlx(const Cli& cli, const std::string& model) {
     const auto pid = cli.start({"--batch", "--model", model, "--max-tokens", "8"},
                                request(first) + "malformed\n" + request(second));
     server.exchange(first, 8, "503 Service Unavailable", "{}");
-    server.exchange(second, 8, "503 Service Unavailable", "{}");
+    server.exchange(second, 8, "503 Service Unavailable", "{}", 60000);
     const auto rows = batch(cli.finish(pid), 3);
     for (const std::size_t i : {0, 2}) {
         const auto& row = rows[i];

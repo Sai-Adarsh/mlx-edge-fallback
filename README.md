@@ -69,13 +69,13 @@ checkpoint. A local server supplies the HTTP 503 responses.
 
 To measure the application and MLX code, configure each build separately
 with Clang and `-DCMAKE_CXX_FLAGS="-fprofile-instr-generate -fcoverage-mapping"`.
-Run these commands in the source directory with a fresh instrumented build.
+On macOS, run these commands from the source directory with a fresh instrumented build. On Linux, use the matching LLVM tools directly.
 
 ```sh
 build_dir=build  # Use build-mlx for the Metal configuration.
 LLVM_PROFILE_FILE="$PWD/$build_dir/%p-%m.profraw" \
   ctest --test-dir "$build_dir" --output-on-failure
-llvm-profdata merge -sparse "$build_dir"/*.profraw -o "$build_dir/run.profdata"
-llvm-cov report "$build_dir/edge_fallback" \
+xcrun llvm-profdata merge -sparse "$build_dir"/*.profraw -o "$build_dir/run.profdata"
+xcrun llvm-cov report "$build_dir/edge_fallback" \
   -instr-profile "$build_dir/run.profdata" "$PWD/src"
 ```
