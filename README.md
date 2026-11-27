@@ -186,6 +186,26 @@ cmake --build build-mlx --target edge_kv_cache_test --parallel 1
 ./build-mlx/edge_kv_cache_test --probe
 ```
 
+### Short 3B decode at 2,700 prompt tokens
+
+A follow-up compared the parent (`1786e65`) and allocator change
+(`a6b6446`) in eight fresh processes on the same M3 Pro and 4-bit Llama
+3.2 3B checkpoint. Each process ran the same 1,164-token seed, then one
+2,700-token request capped at eight generated tokens. Two mirrored
+blocks covered cache-off and a verified 1,024-token cache hit. Both
+binaries used a test-only 64 MiB MLX allocator cache cap. All eight
+measured outputs had identical token IDs.
+
+| Prefix reuse | Parent median | Reserved KV median | Paired changes |
+| --- | ---: | ---: | --- |
+| Off | 29.63 tok/s | 32.30 tok/s | +0.5%, +16.5% |
+| On | 31.07 tok/s | 30.81 tok/s | −35.5%, +36.0% |
+
+The seven measured decode intervals per process include any first-append
+reservation. Two samples per setting give a small observation for this
+short workload. The cache-hit pairs moved in opposite directions.
+[Raw follow-up samples](evidence/mlx-decode-kv-2700-ab.csv)
+
 ## Tests
 
 The default build tests the CLI against a local HTTP server. It covers cloud
