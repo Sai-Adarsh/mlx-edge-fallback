@@ -1,3 +1,5 @@
+#include "../src/cloud_circuit.hpp"
+
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -138,6 +140,13 @@ void test_arguments_and_batch(const Cli& cli, bool mlx) {
     rejects(cli, {"--max-tokens", "1x"}, "must be an integer");
     rejects(cli, {"--max-tokens", "0"}, "must be an integer");
     rejects(cli, {"--max-tokens", "1025"}, "must be an integer");
+    rejects(cli, {"--batch", "--prefix-cache-tokens", "8"}, "requires --batch and --model");
+    rejects(cli, {"--batch", "--model", "local", "--prefix-cache-tokens", "4097"}, "must be an integer");
+    rejects(cli, {"--batch", "--cloud-timeout-ms", "-1"}, "must be an integer");
+    rejects(cli, {"--batch", "--cloud-cooldown-ms", "600001"}, "must be an integer");
+    rejects(cli, {"--batch", "--cloud-cooldown-ms", "5"}, "requires cloud-first --batch with --model");
+    rejects(cli, {"--demo", "--batch", "--model", "missing", "--cloud-cooldown-ms", "5"},
+            "requires cloud-first --batch with --model");
     rejects(cli, {"--prompt", "x"}, "Set CLOUD_BASE_URL");
     if (!mlx) rejects(cli, {"--offline", "--model", "missing", "--prompt", "x"}, "EDGE_ENABLE_MLX");
     const auto demo = cli.run({"--demo"});
@@ -172,9 +181,17 @@ public:
 
     std::string url() const { return "http://127.0.0.1:" + std::to_string(ntohs(address_.sin_port)) + "/v1//"; }
 
-    void exchange(std::string_view prompt, int tokens, std::string_view status, const std::string& content) {
+    bool has_pending_request() const {
         pollfd listener{socket_.get(), POLLIN, 0};
-        require(poll(&listener, 1, 8000) == 1, "edge CLI did not connect");
+        const int result = poll(&listener, 1, 0);
+        require(result >= 0, "testing for unexpected connections failed");
+        return result > 0;
+    }
+
+    void exchange(std::string_view prompt, int tokens, std::string_view status, const std::string& content,
+                  int wait_ms = 8000, std::size_t missing_bytes = 0) {
+        pollfd listener{socket_.get(), POLLIN, 0};
+        require(poll(&listener, 1, wait_ms) == 1, "edge CLI did not connect");
         Socket connection(accept(socket_.get(), nullptr, nullptr));
         const timeval timeout{5, 0};
         require(setsockopt(connection.get(), SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0,
@@ -203,7 +220,7 @@ public:
                 && payload.at("max_tokens") == tokens
                 && payload.at("messages").at(0).at("content") == prompt, "unexpected request " + payload.dump());
         const auto response = "HTTP/1.1 " + std::string(status) + "\r\nContent-Type: application/json\r\n"
-            "Connection: close\r\nContent-Length: " + std::to_string(content.size()) + "\r\n\r\n" + content;
+            "Connection: close\r\nContent-Length: " + std::to_string(content.size() + missing_bytes) + "\r\n\r\n" + content;
         std::size_t sent = 0;
         while (sent < response.size()) {
             const auto count = send(connection.get(), response.data() + sent, response.size() - sent, 0);
@@ -219,25 +236,51 @@ void point_at(const Server& server) {
     setenv("CLOUD_MODEL", "test-model", 1);
     setenv("CLOUD_API_KEY", "test-key", 1);
     setenv("NO_PROXY", "127.0.0.1", 1);
+    setenv("no_proxy", "127.0.0.1", 1);
+}
+
+void test_circuit_clock() {
+    using namespace std::chrono_literals;
+    const CloudCircuit::Clock::time_point start{};
+    CloudCircuit circuit(100ms);
+    require(!circuit.bypass(start), "fresh circuit bypassed");
+    circuit.observe(429, start);
+    require(!circuit.bypass(start), "rate limit opened the circuit");
+    circuit.observe(503, start);
+    require(circuit.bypass(start + 99ms), "circuit closed before the deadline");
+    require(!circuit.bypass(start + 100ms), "probe blocked at the deadline");
+    circuit.observe(503, start + 100ms);
+    require(circuit.bypass(start + 199ms), "failed probe did not reopen the circuit");
+    circuit.observe(200, start + 200ms);
+    require(!circuit.bypass(start + 200ms), "successful probe did not clear the circuit");
+    CloudCircuit disabled(0ms);
+    disabled.observe(503, start);
+    require(!disabled.bypass(start), "default settings opened a circuit");
 }
 
 void test_cloud(const Cli& cli) {
+    test_circuit_clock();
     Server server;
     point_at(server);
     const auto pid = cli.start({"--batch", "--max-tokens", "16"},
         "{\"prompt\":\"one\"}\n{\"prompt\":\"two\",\"max_tokens\":8}\n"
-        "{\"prompt\":\"three\"}\n{\"prompt\":\"four\"}\n{\"prompt\":\"five\"}\n");
+        "{\"prompt\":\"three\"}\n{\"prompt\":\"four\"}\n{\"prompt\":\"five\"}\n"
+        "{\"prompt\":\"truncated unavailable\"}\n{\"prompt\":\"truncated success\"}\n");
     server.exchange("one", 16, "200 OK", R"({"choices":[{"message":{"content":"upstream"}}]})");
     server.exchange("two", 8, "503 Service Unavailable", "{}");
     server.exchange("three", 16, "429 Too Many Requests", "{}");
     server.exchange("four", 16, "200 OK", R"({"choices":[]})");
     server.exchange("five", 16, "200 OK", std::string(4 * 1024 * 1024 + 1, 'a'));
-    const auto rows = batch(cli.finish(pid), 5);
+    server.exchange("truncated unavailable", 16, "503 Service Unavailable", "{}", 8000, 1);
+    server.exchange("truncated success", 16, "200 OK", R"({"choices":[{"message":{"content":"partial"}}]})", 8000, 1);
+    const auto rows = batch(cli.finish(pid), 7);
     require(rows[0].at("source") == "cloud" && rows[0].at("text") == "upstream", rows[0].dump());
     require(rows[1].at("error").get<std::string>().find("Pass --model") != std::string::npos, rows[1].dump());
     require(rows[2].at("error") == "Cloud HTTP 429", rows[2].dump());
     require(rows[3].at("ok") == false, rows[3].dump());
     require(rows[4].at("error").get<std::string>().starts_with("Cloud request failed:"), rows[4].dump());
+    require(rows[5].at("error").get<std::string>().find("Pass --model") != std::string::npos, rows[5].dump());
+    require(rows[6].at("error").get<std::string>().starts_with("Cloud request failed:"), rows[6].dump());
 }
 
 #ifdef EDGE_TEST_MLX
@@ -256,6 +299,29 @@ void test_dense_checkpoint(const Cli& cli) {
     require(rows[1].at("text") == "yes yes yes" && rows[1].at("local_metrics").at("model_reused") == true,
             rows[1].dump());
     require(rows[2].at("local_metrics").at("generated_tokens") == 1, rows[2].dump());
+
+    auto prefix_args = args;
+    const auto prompt_size = rows[2].at("local_metrics").at("prompt_tokens").get<int>();
+    prefix_args.insert(prefix_args.end(), {"--prefix-cache-tokens", std::to_string(prompt_size - 1),
+                                           "--trace-token-ids"});
+    const std::string prompt = R"({"prompt":"hello","max_tokens":1})";
+    const auto prefix_rows = batch(cli.run(prefix_args, prompt + "\n" + prompt), 2);
+    require(prefix_rows[0].at("generated_token_ids") == Json::array({2}), prefix_rows[0].dump());
+    require(prefix_rows[1].at("generated_token_ids") == Json::array({2}), prefix_rows[1].dump());
+    require(prefix_rows[1].at("local_metrics").at("reused_prefix_tokens") == prompt_size - 1, prefix_rows[1].dump());
+    require(!rows[2].contains("generated_token_ids"), rows[2].dump());
+
+    auto exact_length = args;
+    exact_length.insert(exact_length.end(), {"--prefix-cache-tokens", std::to_string(prompt_size)});
+    const auto no_suffix = batch(cli.run(exact_length, prompt), 1).front();
+    require(no_suffix.at("ok") == true && no_suffix.at("local_metrics").at("retained_prefix_tokens") == 0,
+            no_suffix.dump());
+
+    auto invalid_prefix = args;
+    invalid_prefix.insert(invalid_prefix.end(), {"--prefix-cache-tokens", "16"});
+    const auto over_limit = batch(cli.run(invalid_prefix, prompt), 1).front();
+    require(over_limit.at("ok") == false && over_limit.at("error").get<std::string>().find("model context limit")
+            != std::string::npos, over_limit.dump());
 
     const auto expect_error = [&](std::string_view error) {
         const auto row = batch(cli.run(args, request), 1).front();
@@ -303,21 +369,29 @@ void test_dense_checkpoint(const Cli& cli) {
 }
 #endif
 
-void test_mlx(const Cli& cli, const std::string& model) {
+void test_mlx(const Cli& cli, const std::string& model, bool cooldown) {
     const std::string first = "Reply with just the number. What is 2 plus 2?";
     const std::string second = "Reply with just the number. What is 3 plus 3?";
     Server server;
     point_at(server);
     const auto request = [](const std::string& text) { return Json{{"prompt", text}}.dump() + "\n"; };
-    const auto pid = cli.start({"--batch", "--model", model, "--max-tokens", "8"},
-                               request(first) + "malformed\n" + request(second));
-    server.exchange(first, 8, "503 Service Unavailable", "{}");
-    server.exchange(second, 8, "503 Service Unavailable", "{}");
+    std::vector<std::string> args{"--batch", "--model", model, "--max-tokens", "8"};
+    if (cooldown) {
+        args.insert(args.end(), {"--cloud-cooldown-ms", "600000", "--cloud-timeout-ms", "2000"});
+        const auto probe = cli.run(args, "");
+        require(probe.code == 0, "cooldown flag rejected: " + probe.error);
+    }
+    const auto pid = cli.start(std::move(args), request(first) + "malformed\n" + request(second));
+    server.exchange(first, 8, "503 Service Unavailable", "{}", 8000, cooldown ? 1 : 0);
+    if (!cooldown) server.exchange(second, 8, "503 Service Unavailable", "{}", 60000);
     const auto rows = batch(cli.finish(pid), 3);
     for (const std::size_t i : {0, 2}) {
         const auto& row = rows[i];
         const auto& metrics = row.at("local_metrics");
-        require(row.at("source") == "mlx" && row.at("cloud_status") == 503 && row.at("ok") == true, row.dump());
+        const bool skipped = cooldown && i == 2;
+        require(row.at("source") == "mlx" && row.at("ok") == true, row.dump());
+        require(skipped ? row.at("cloud_status").is_null() : row.at("cloud_status") == 503, row.dump());
+        require(row.at("fallback_reason") == (skipped ? "circuit_open" : "cloud_503"), row.dump());
         require(metrics.at("model_reused") == (i == 2) && metrics.at("generated_tokens").get<int>() > 0,
                 row.dump());
         require(i == 0 ? metrics.at("load_ms").get<double>() > 0.0 : metrics.at("load_ms") == 0.0, row.dump());
@@ -325,12 +399,54 @@ void test_mlx(const Cli& cli, const std::string& model) {
     require(rows[0].at("text").get<std::string>().find('4') != std::string::npos, rows[0].dump());
     require(rows[1].at("ok") == false, rows[1].dump());
     require(rows[2].at("text").get<std::string>().find('6') != std::string::npos, rows[2].dump());
+    require(!server.has_pending_request(), "the skipped request reached the cloud server");
     const auto offline = batch(cli.run({"--batch", "--offline", "--model", model, "--max-tokens", "1"},
                                    request(first) + request("<|reserved|>")), 2);
     require(offline[0].at("source") == "mlx" && offline[0].at("cloud_status").is_null()
             && offline[0].at("local_metrics").at("generated_tokens") == 1, offline[0].dump());
     require(offline[1].at("error") == "Prompt contains a reserved chat token prefix.", offline[1].dump());
 }
+void test_prefix_cache(const Cli& cli, const std::string& model) {
+    std::string common = "Use the following service handbook to answer the final question.\n";
+    for (int i = 1; i <= 18; ++i) {
+        common += "Service " + std::to_string(i) + " uses the standard weekday schedule and records all changes.\n";
+    }
+    const std::string north = "The reference ticket number is 17.\n";
+    const std::string south = "The reference ticket number is 38.\n";
+    const std::string ask_ticket = "What is the reference ticket number in the first sentence? Reply with just the number.";
+    const auto first = north + common + ask_ticket;
+    const auto second = north + common + "Write six even numbers starting at two, separated by commas.";
+    const auto changed = south + common + ask_ticket;
+    const auto short_prompt = "What is 1 plus 1?";
+    const std::vector<std::string> prompts{first, second, short_prompt, first, changed, first, second};
+    std::string input;
+    for (const auto& prompt : prompts) input += Json{{"prompt", prompt}}.dump() + "\n";
+
+    const std::vector<std::string> base{"--batch", "--offline", "--model", model,
+                                        "--max-tokens", "4", "--trace-token-ids"};
+    auto enabled = base;
+    enabled.insert(enabled.end(), {"--prefix-cache-tokens", "128"});
+    const auto original = batch(cli.run(base, input), prompts.size());
+    const auto cached = batch(cli.run(enabled, input), prompts.size());
+    const std::vector<int> reuse{0, 128, 0, 128, 0, 0, 128};
+    require(original[0].at("generated_token_ids") != original[4].at("generated_token_ids"),
+            "fixture answer did not depend on the replaced prefix");
+    require(original[1].at("generated_token_ids").size() > 1, "fixture did not exercise cached decode");
+    for (std::size_t i = 0; i < prompts.size(); ++i) {
+        const auto& row = cached[i];
+        require(row.at("ok") == true && original[i].at("ok") == true, row.dump());
+        require(!row.at("generated_token_ids").empty() &&
+                row.at("generated_token_ids") == original[i].at("generated_token_ids"),
+                "token parity failed for row " + std::to_string(i + 1) + ": " + row.dump());
+        require(row.at("text") == original[i].at("text"), row.dump());
+        const auto& metrics = row.at("local_metrics");
+        require(metrics.at("reused_prefix_tokens") == reuse[i], row.dump());
+        require(metrics.at("retained_prefix_tokens") == 128, row.dump());
+        require(metrics.at("retained_prefix_bytes").get<std::size_t>() > 0, row.dump());
+        require(original[i].at("local_metrics").at("retained_prefix_bytes") == 0, original[i].dump());
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) try {
@@ -341,9 +457,12 @@ int main(int argc, char** argv) try {
     unsetenv("CLOUD_API_KEY");
     const Cli cli(argv[1]);
     const std::string_view mode = argv[2];
-    if (mode == "mlx") {
+    if (mode == "mlx-prefix") {
         require(argc == 4, "missing test model");
-        test_mlx(cli, argv[3]);
+        test_prefix_cache(cli, argv[3]);
+    } else if (mode == "mlx" || mode == "mlx-cooldown") {
+        require(argc == 4, "missing test model");
+        test_mlx(cli, argv[3], mode == "mlx-cooldown");
 #ifdef EDGE_TEST_MLX
     } else if (mode == "dense") {
         test_dense_checkpoint(cli);
