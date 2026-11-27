@@ -9,11 +9,12 @@ binary=$1
 model=$2
 prefix=$3
 pairs=$4
-case "$prefix" in 0|''|*[!0-9]*) exit 2 ;; esac
-case "$pairs" in 0|''|*[!0-9]*) exit 2 ;; esac
+case "$prefix" in 0*|''|*[!0-9]*) exit 2 ;; esac
+case "$pairs" in 0*|''|*[!0-9]*) exit 2 ;; esac
 export LC_ALL=C
 scratch="$(mktemp -d)"
-trap 'rm -rf "$scratch"' EXIT HUP INT TERM
+trap 'rm -rf "$scratch"' EXIT
+trap 'exit 130' HUP INT TERM
 
 jq -nc '
     def q($a; $b): "Reply with just the number. What is \($a) plus \($b)?";
