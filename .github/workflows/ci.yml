@@ -5,6 +5,10 @@ on:
   push:
     branches: [main]
 
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -35,10 +39,16 @@ jobs:
         with:
           persist-credentials: false
       - name: Install MLX and tokenizers-cpp
+        env:
+          TOKENIZERS_CPP_REVISION: c586c52f93f7b060753bd2388eb96a105cb7374d
         run: |
           python3 -m pip install --target "$RUNNER_TEMP/mlx" --no-deps --only-binary=:all: mlx-metal==0.32.5
-          git clone --branch v0.1.1 --depth 1 --recurse-submodules --shallow-submodules \
-            https://github.com/mlc-ai/tokenizers-cpp.git "$RUNNER_TEMP/tokenizers-cpp"
+          tokenizer_dir="$RUNNER_TEMP/tokenizers-cpp"
+          git init "$tokenizer_dir"
+          git -C "$tokenizer_dir" remote add origin https://github.com/mlc-ai/tokenizers-cpp.git
+          git -C "$tokenizer_dir" fetch --depth 1 origin "$TOKENIZERS_CPP_REVISION"
+          git -C "$tokenizer_dir" checkout --detach FETCH_HEAD
+          git -C "$tokenizer_dir" submodule update --init --recursive --depth 1
       - name: Configure and build the MLX backend
         run: |
           cmake -S . -B build-mlx -DCMAKE_BUILD_TYPE=Release -DEDGE_ENABLE_MLX=ON \
