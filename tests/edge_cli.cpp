@@ -406,9 +406,12 @@ void test_prefix_cache(const Cli& cli, const std::string& model) {
     for (int i = 1; i <= 18; ++i) {
         common += "Service " + std::to_string(i) + " uses the standard weekday schedule and records all changes.\n";
     }
-    const auto first = "North office. " + common + "Answer with just the number. What is 2 plus 2?";
-    const auto second = "North office. " + common + "Answer with just the number. What is 3 plus 3?";
-    const auto changed = "South office. " + common + "Answer with just the number. What is 2 plus 2?";
+    const std::string north = "The reference ticket number is 17.\n";
+    const std::string south = "The reference ticket number is 38.\n";
+    const std::string ask_ticket = "What is the reference ticket number in the first sentence? Reply with just the number.";
+    const auto first = north + common + ask_ticket;
+    const auto second = north + common + "Write six even numbers starting at two, separated by commas.";
+    const auto changed = south + common + ask_ticket;
     const auto short_prompt = "What is 1 plus 1?";
     const std::vector<std::string> prompts{first, second, short_prompt, first, changed, first, second};
     std::string input;
@@ -421,6 +424,9 @@ void test_prefix_cache(const Cli& cli, const std::string& model) {
     const auto original = batch(cli.run(base, input), prompts.size());
     const auto cached = batch(cli.run(enabled, input), prompts.size());
     const std::vector<int> reuse{0, 128, 0, 128, 0, 0, 128};
+    require(original[0].at("generated_token_ids") != original[4].at("generated_token_ids"),
+            "fixture answer did not depend on the replaced prefix");
+    require(original[1].at("generated_token_ids").size() > 1, "fixture did not exercise cached decode");
     for (std::size_t i = 0; i < prompts.size(); ++i) {
         const auto& row = cached[i];
         require(row.at("ok") == true && original[i].at("ok") == true, row.dump());
