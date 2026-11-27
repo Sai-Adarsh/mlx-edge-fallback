@@ -264,18 +264,23 @@ void test_cloud(const Cli& cli) {
     point_at(server);
     const auto pid = cli.start({"--batch", "--max-tokens", "16"},
         "{\"prompt\":\"one\"}\n{\"prompt\":\"two\",\"max_tokens\":8}\n"
-        "{\"prompt\":\"three\"}\n{\"prompt\":\"four\"}\n{\"prompt\":\"five\"}\n");
+        "{\"prompt\":\"three\"}\n{\"prompt\":\"four\"}\n{\"prompt\":\"five\"}\n"
+        "{\"prompt\":\"truncated unavailable\"}\n{\"prompt\":\"truncated success\"}\n");
     server.exchange("one", 16, "200 OK", R"({"choices":[{"message":{"content":"upstream"}}]})");
     server.exchange("two", 8, "503 Service Unavailable", "{}");
     server.exchange("three", 16, "429 Too Many Requests", "{}");
     server.exchange("four", 16, "200 OK", R"({"choices":[]})");
     server.exchange("five", 16, "200 OK", std::string(4 * 1024 * 1024 + 1, 'a'));
-    const auto rows = batch(cli.finish(pid), 5);
+    server.exchange("truncated unavailable", 16, "503 Service Unavailable", "{}", 8000, 1);
+    server.exchange("truncated success", 16, "200 OK", R"({"choices":[{"message":{"content":"partial"}}]})", 8000, 1);
+    const auto rows = batch(cli.finish(pid), 7);
     require(rows[0].at("source") == "cloud" && rows[0].at("text") == "upstream", rows[0].dump());
     require(rows[1].at("error").get<std::string>().find("Pass --model") != std::string::npos, rows[1].dump());
     require(rows[2].at("error") == "Cloud HTTP 429", rows[2].dump());
     require(rows[3].at("ok") == false, rows[3].dump());
     require(rows[4].at("error").get<std::string>().starts_with("Cloud request failed:"), rows[4].dump());
+    require(rows[5].at("error").get<std::string>().find("Pass --model") != std::string::npos, rows[5].dump());
+    require(rows[6].at("error").get<std::string>().starts_with("Cloud request failed:"), rows[6].dump());
 }
 
 #ifdef EDGE_TEST_MLX
