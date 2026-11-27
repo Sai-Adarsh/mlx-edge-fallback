@@ -31,4 +31,18 @@ For cloud-first requests, set `CLOUD_BASE_URL` through `/v1`, set `CLOUD_MODEL` 
 
 In a local run on Apple Silicon with MLX 0.32.5, the loopback server returned HTTP 503. The 4-bit Llama 3.2 3B checkpoint then generated `4` for a short arithmetic prompt on Metal.
 
+## Keep the local model warm
+
+Pass `--batch` to read independent JSON requests from stdin and write one JSON reply per line. An optional `max_tokens` overrides the CLI default. A malformed line returns a per-line error and the next request can still run. The process limits input records to 64 KiB and handles them sequentially.
+
+```sh
+printf '%s\n' '{"prompt":"What is 2 + 2? Answer with a number only.","max_tokens":5}' \
+  '{"prompt":"What is 3 + 3? Answer with a number only.","max_tokens":5}' |
+  ./build-mlx/edge_fallback --offline --batch --model /path/to/Llama-3.2-3B-Instruct-4bit
+```
+
+The first local request loads the tokenizer and materializes the weights. Each request has its own KV cache, so one prompt never becomes part of the next request's context. The same batch interface can call the cloud first by omitting `--offline`. Local replies report whether the weights were reused, initial load time, prefill time, total local generation time, and token counts. Prefill time includes tokenization and the first decoding decision. Total generation time excludes weight loading and the cloud request.
+
+In a loopback HTTP 503 run on Apple Silicon, the first request returned `4` after loading the model in about 1,085 ms. An invalid input line produced an error. The next request returned `6` using the resident weights and reported zero load time.
+
 References: [MLX C++ build guide](https://github.com/ml-explore/mlx/blob/main/docs/src/dev/mlx_in_cpp.rst) and [Qwen2.5 architecture configuration](https://huggingface.co/Qwen/Qwen2.5-3B-Instruct/blob/main/config.json).

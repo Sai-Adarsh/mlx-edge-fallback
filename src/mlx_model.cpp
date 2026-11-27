@@ -4,6 +4,8 @@
 #include <nlohmann/json.hpp>
 #include <tokenizers_cpp.h>
 
+#include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <fstream>
@@ -72,7 +74,7 @@ struct Config {
           tied_embedding(config.value("tie_word_embeddings", false)) {
         if ((config.at("model_type") != "qwen2" && config.at("model_type") != "llama")
             || config.value("use_sliding_window", false)
-            || hidden <= 0 || heads <= 0 || kv_heads <= 0 || layers <= 0
+            || hidden <= 0 || heads <= 0 || kv_heads <= 0 || layers <= 0 || vocabulary <= 0 || max_context <= 0
             || hidden % heads != 0 || heads % kv_heads != 0 || (hidden / heads) % 2 != 0
             || config.value("head_dim", hidden / heads) != hidden / heads) {
             throw std::runtime_error("Expected a supported Qwen2 or Llama checkpoint with full attention.");
@@ -125,10 +127,10 @@ std::optional<mx::array> rope_periods(const Json& config, int head_size, float b
 }
 
 class Decoder {
-    Config config_;
-    Weights weights_;
+    const Config& config_;
+    const Weights& weights_;
     std::vector<std::optional<Cache>> cache_;
-    std::optional<mx::array> rope_periods_;
+    const std::optional<mx::array>& rope_periods_;
     int offset_ = 0;
 
     const mx::array& weight(const std::string& name) const {
@@ -190,11 +192,8 @@ class Decoder {
     }
 
 public:
-    Decoder(const Json& config, Weights weights)
-        : config_(config), weights_(std::move(weights)), cache_(config_.layers),
-          rope_periods_(rope_periods(config, config_.hidden / config_.heads, config_.rope_base)) {}
-
-    int max_context() const { return config_.max_context; }
+    Decoder(const Config& config, const Weights& weights, const std::optional<mx::array>& periods)
+        : config_(config), weights_(weights), cache_(config.layers), rope_periods_(periods) {}
 
     int next_token(const std::vector<std::int32_t>& tokens) {
         const auto steps = static_cast<int>(tokens.size());
@@ -235,39 +234,71 @@ std::string chat_prompt(const std::string& prompt, const Json& config) {
 }
 } // namespace
 
-std::string generate_local(const std::filesystem::path& directory, const std::string& prompt, int max_tokens) {
+struct LocalModel::Impl {
+    Json config_json;
+    Config config;
+    Weights weights;
+    std::optional<mx::array> periods;
+    std::unique_ptr<tokenizers::Tokenizer> tokenizer;
+    std::vector<int> stop_ids;
+
+    explicit Impl(const std::filesystem::path& directory)
+        : config_json(Json::parse(read_file(directory / "config.json"))),
+          config(config_json), weights(load_weights(directory)),
+          periods(rope_periods(config_json, config.hidden / config.heads, config.rope_base)),
+          tokenizer(tokenizers::Tokenizer::FromBlobJSON(read_file(directory / "tokenizer.json"))) {
+        if (!tokenizer) {
+            throw std::runtime_error("Cannot load the model tokenizer.");
+        }
+        for (const auto& token : config_json.at("eos_token_id")) {
+            stop_ids.push_back(token.get<int>());
+        }
+        for (const auto* special : {"<|endoftext|>", "<|im_start|>", "<|start_header_id|>"}) {
+            const int id = tokenizer->TokenToId(special);
+            if (id >= 0) stop_ids.push_back(id);
+        }
+        std::vector<mx::array> arrays;
+        arrays.reserve(weights.size());
+        for (const auto& [name, weight] : weights) arrays.push_back(weight);
+        mx::eval(arrays);
+    }
+};
+
+LocalModel::LocalModel(const std::filesystem::path& directory) {
     if (!mx::is_available(mx::Device::gpu)) {
         throw std::runtime_error("MLX Metal GPU is unavailable.");
     }
     mx::set_default_device(mx::Device::gpu);
-    const auto config = Json::parse(read_file(directory / "config.json"));
-    auto tokenizer = tokenizers::Tokenizer::FromBlobJSON(read_file(directory / "tokenizer.json"));
-    if (!tokenizer) {
-        throw std::runtime_error("Cannot load the model tokenizer.");
-    }
-    const auto prompt_tokens = tokenizer->Encode(chat_prompt(prompt, config));
-    Decoder model(config, load_weights(directory));
+    impl_ = std::make_unique<Impl>(directory);
+}
+
+LocalModel::~LocalModel() = default;
+
+LocalGeneration LocalModel::generate(const std::string& prompt, int max_tokens) {
+    using Clock = std::chrono::steady_clock;
+    const auto started = Clock::now();
+    if (max_tokens < 1) throw std::runtime_error("max_tokens must be positive.");
+    auto& model = *impl_;
+    const auto prompt_tokens = model.tokenizer->Encode(chat_prompt(prompt, model.config_json));
     if (prompt_tokens.empty() || prompt_tokens.size() + static_cast<std::size_t>(max_tokens) >
-            static_cast<std::size_t>(model.max_context())) {
+            static_cast<std::size_t>(model.config.max_context)) {
         throw std::runtime_error("Prompt and generation budget exceed the model context.");
     }
-    const auto& eos = config.at("eos_token_id");
-    const auto is_stop = [&](int token) {
-        for (const auto& id : eos) {
-            if (id == token) return true;
-        }
-        return token == tokenizer->TokenToId("<|endoftext|>")
-            || token == tokenizer->TokenToId("<|im_start|>")
-            || token == tokenizer->TokenToId("<|start_header_id|>");
-    };
+    Decoder decoder(model.config, model.weights, model.periods);
     std::vector<std::int32_t> generated;
-    auto next = model.next_token(prompt_tokens);
-    while (!is_stop(next)) {
+    auto next = decoder.next_token(prompt_tokens);
+    const auto first = Clock::now();
+    while (std::find(model.stop_ids.begin(), model.stop_ids.end(), next) == model.stop_ids.end()) {
         generated.push_back(next);
         if (generated.size() >= static_cast<std::size_t>(max_tokens)) {
             break;
         }
-        next = model.next_token({next});
+        next = decoder.next_token({next});
     }
-    return tokenizer->Decode(generated);
+    auto text = model.tokenizer->Decode(generated);
+    const auto milliseconds = [](auto duration) {
+        return std::chrono::duration<double, std::milli>(duration).count();
+    };
+    return {std::move(text), prompt_tokens.size(), generated.size(),
+            milliseconds(first - started), milliseconds(Clock::now() - started)};
 }

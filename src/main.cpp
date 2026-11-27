@@ -3,9 +3,12 @@
 #include <curl/curl.h>
 #include <nlohmann/json.hpp>
 
+#include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -100,6 +103,7 @@ struct Arguments {
     int max_tokens = 64;
     bool demo = false;
     bool offline = false;
+    bool batch = false;
 };
 
 Arguments arguments(int argc, char** argv) {
@@ -110,6 +114,8 @@ Arguments arguments(int argc, char** argv) {
             args.demo = true;
         } else if (arg == "--offline") {
             args.offline = true;
+        } else if (arg == "--batch") {
+            args.batch = true;
         } else if (arg == "--prompt" || arg == "--model" || arg == "--max-tokens") {
             if (++i >= argc) {
                 throw std::runtime_error("Missing value for " + std::string(arg));
@@ -130,54 +136,135 @@ Arguments arguments(int argc, char** argv) {
             throw std::runtime_error("Unknown argument: " + std::string(arg));
         }
     }
-    if (args.demo && args.prompt.empty()) {
+    if (args.batch && !args.prompt.empty()) {
+        throw std::runtime_error("Use either --batch or --prompt.");
+    }
+    if (!args.batch && args.demo && args.prompt.empty()) {
         args.prompt = "Explain why local inference helps during a cloud outage.";
     }
-    if (args.prompt.empty()) {
-        throw std::runtime_error("Supply --prompt TEXT or --demo.");
+    if (!args.batch && args.prompt.empty()) {
+        throw std::runtime_error("Supply --prompt TEXT, --batch, or --demo.");
     }
     if ((args.offline && !args.demo) && args.model_directory.empty()) {
         throw std::runtime_error("--offline requires --model DIR.");
     }
     return args;
 }
+class Session {
+public:
+    explicit Session(const Arguments& args) : args_(args) {}
+
+    Json generate(const std::string& prompt, int max_tokens) {
+        if (prompt.empty()) throw std::runtime_error("prompt must be a nonempty string");
+        const auto reply = args_.demo || args_.offline
+            ? Reply{503, {}}
+            : call_cloud(environment("CLOUD_BASE_URL"), environment("CLOUD_MODEL"), prompt, max_tokens);
+        if (reply.status != 503) {
+            return {{"source", "cloud"}, {"text", completion(reply)}};
+        }
+        if (args_.demo && args_.model_directory.empty()) {
+            return {
+                {"source", "fixture"},
+                {"cloud_status", 503},
+                {"text", "Local inference keeps serving requests when the cloud is unavailable."}
+            };
+        }
+        if (args_.model_directory.empty()) {
+            throw std::runtime_error("Cloud returned HTTP 503. Pass --model DIR for local inference.");
+        }
+#ifdef EDGE_HAS_MLX
+        const bool reused = static_cast<bool>(local_);
+        double load_ms = 0.0;
+        if (!local_) {
+            const auto start = std::chrono::steady_clock::now();
+            local_ = std::make_unique<LocalModel>(args_.model_directory);
+            load_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        }
+        auto result = local_->generate(prompt, max_tokens);
+        return {
+            {"source", "mlx"},
+            {"cloud_status", args_.offline ? Json(nullptr) : Json(503)},
+            {"text", std::move(result.text)},
+            {"local_metrics", {
+                {"model_reused", reused}, {"load_ms", load_ms}, {"prefill_ms", result.prefill_ms},
+                {"generation_ms", result.generation_ms}, {"prompt_tokens", result.prompt_tokens},
+                {"generated_tokens", result.generated_tokens}
+            }}
+        };
+#else
+        throw std::runtime_error("Build with EDGE_ENABLE_MLX=ON to use a local model.");
+#endif
+    }
+
+private:
+    const Arguments& args_;
+#ifdef EDGE_HAS_MLX
+    std::unique_ptr<LocalModel> local_;
+#endif
+};
+
+struct BatchLine {
+    std::string value;
+    bool too_large = false;
+};
+
+std::optional<BatchLine> read_batch_line(std::istream& input) {
+    constexpr std::size_t max_line = 64 * 1024;
+    BatchLine line;
+    for (char value; input.get(value);) {
+        if (value == '\n') return line;
+        if (line.value.size() < max_line) line.value.push_back(value);
+        else line.too_large = true;
+    }
+    if (input.bad()) throw std::runtime_error("Failed to read batch input.");
+    if (line.value.empty()) return std::nullopt;
+    return line;
+}
+
+Json process_batch_line(const BatchLine& line, Session& session, int default_tokens) {
+    if (line.too_large) throw std::runtime_error("Request line exceeds 64 KiB.");
+    const auto request = Json::parse(line.value, nullptr, false);
+    if (!request.is_object() || !request.contains("prompt") || !request["prompt"].is_string()) {
+        throw std::runtime_error("Each line must be a JSON object with a string prompt.");
+    }
+    int max_tokens = default_tokens;
+    if (request.contains("max_tokens")) {
+        const auto& tokens = request["max_tokens"];
+        if (!tokens.is_number_integer() || tokens.get<std::int64_t>() < 1 || tokens.get<std::int64_t>() > 1024) {
+            throw std::runtime_error("max_tokens must be an integer from 1 to 1024.");
+        }
+        max_tokens = tokens.get<int>();
+    }
+    return session.generate(request["prompt"].get_ref<const std::string&>(), max_tokens);
+}
 } // namespace
 
 int main(int argc, char** argv) {
     try {
         if (argc == 1 || (argc == 2 && std::string_view(argv[1]) == "--help")) {
-            std::cout << "edge_fallback [--demo | --offline] --prompt TEXT --model DIR [--max-tokens N]\n";
+            std::cout << "edge_fallback [--demo | --offline] [--prompt TEXT | --batch] [--model DIR] [--max-tokens N]\n";
             return 0;
         }
         const auto args = arguments(argc, argv);
-        const auto reply = args.demo || args.offline
-            ? Reply{503, {}}
-            : call_cloud(environment("CLOUD_BASE_URL"), environment("CLOUD_MODEL"), args.prompt, args.max_tokens);
-        if (reply.status != 503) {
-            std::cout << Json{{"source", "cloud"}, {"text", completion(reply)}}.dump() << '\n';
+        Session session(args);
+        if (args.batch) {
+            std::size_t line_number = 0;
+            while (auto line = read_batch_line(std::cin)) {
+                ++line_number;
+                try {
+                    auto output = process_batch_line(*line, session, args.max_tokens);
+                    output["line"] = line_number;
+                    output["ok"] = true;
+                    std::cout << output.dump() << std::endl;
+                } catch (const std::exception& error) {
+                    std::cout << Json{{"line", line_number}, {"ok", false}, {"error", error.what()}}.dump()
+                              << std::endl;
+                }
+            }
             return 0;
         }
-        if (args.demo && args.model_directory.empty()) {
-            std::cout << Json{
-                {"source", "fixture"},
-                {"cloud_status", 503},
-                {"text", "Local inference keeps serving requests when the cloud is unavailable."}
-            }.dump() << '\n';
-            return 0;
-        }
-        if (args.model_directory.empty()) {
-            throw std::runtime_error("Cloud returned HTTP 503. Pass --model DIR for local inference.");
-        }
-#ifdef EDGE_HAS_MLX
-        std::cout << Json{
-            {"source", "mlx"},
-            {"cloud_status", args.offline ? Json(nullptr) : Json(503)},
-            {"text", generate_local(args.model_directory, args.prompt, args.max_tokens)}
-        }.dump() << '\n';
+        std::cout << session.generate(args.prompt, args.max_tokens).dump() << '\n';
         return 0;
-#else
-        throw std::runtime_error("Build with EDGE_ENABLE_MLX=ON to use a local model.");
-#endif
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;
