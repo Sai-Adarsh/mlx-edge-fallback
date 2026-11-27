@@ -24,6 +24,11 @@ struct Reply {
     std::string body;
 };
 
+struct ResponseHeaders {
+    CURL* curl;
+    bool stopped_on_503 = false;
+};
+
 std::string environment(const char* name) {
     const char* value = std::getenv(name);
     return value ? value : "";
@@ -33,9 +38,13 @@ std::size_t finish_on_unavailable(char* data, std::size_t size, std::size_t coun
     const auto bytes = size * count;
     const std::string_view line(data, bytes);
     if (line == "\r\n" || line == "\n") {
+        auto& headers = *static_cast<ResponseHeaders*>(target);
         long status = 0;
-        curl_easy_getinfo(static_cast<CURL*>(target), CURLINFO_RESPONSE_CODE, &status);
-        if (status == 503) return 0;
+        curl_easy_getinfo(headers.curl, CURLINFO_RESPONSE_CODE, &status);
+        if (status == 503) {
+            headers.stopped_on_503 = true;
+            return 0;
+        }
     }
     return bytes;
 }
@@ -89,6 +98,7 @@ Reply call_cloud(std::string base, const std::string& model, const std::string& 
     }
 
     Reply reply{};
+    ResponseHeaders response_headers{curl.get()};
     curl_easy_setopt(curl.get(), CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl.get(), CURLOPT_HTTPHEADER, headers.get());
     curl_easy_setopt(curl.get(), CURLOPT_POSTFIELDS, payload.c_str());
@@ -96,14 +106,17 @@ Reply call_cloud(std::string base, const std::string& model, const std::string& 
     curl_easy_setopt(curl.get(), CURLOPT_CONNECTTIMEOUT_MS, std::min(10000L, timeout_ms));
     curl_easy_setopt(curl.get(), CURLOPT_TIMEOUT_MS, timeout_ms);
     curl_easy_setopt(curl.get(), CURLOPT_HEADERFUNCTION, finish_on_unavailable);
-    curl_easy_setopt(curl.get(), CURLOPT_HEADERDATA, curl.get());
+    curl_easy_setopt(curl.get(), CURLOPT_HEADERDATA, &response_headers);
     curl_easy_setopt(curl.get(), CURLOPT_WRITEFUNCTION, append_response);
     curl_easy_setopt(curl.get(), CURLOPT_WRITEDATA, &reply.body);
     const auto result = curl_easy_perform(curl.get());
     curl_easy_getinfo(curl.get(), CURLINFO_RESPONSE_CODE, &reply.status);
-    // The header callback stops a 503 transfer before libcurl reads the body.
-    if (result != CURLE_OK && reply.status != 503) {
+    if (result == CURLE_WRITE_ERROR && response_headers.stopped_on_503) return reply;
+    if (result != CURLE_OK) {
         throw std::runtime_error(std::string("Cloud request failed: ") + curl_easy_strerror(result));
+    }
+    if (reply.status == 503) {
+        throw std::runtime_error("Cloud request failed: incomplete HTTP 503 headers.");
     }
     return reply;
 }
