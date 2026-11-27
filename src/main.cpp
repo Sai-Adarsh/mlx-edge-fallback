@@ -106,10 +106,12 @@ struct Arguments {
     std::string prompt;
     std::filesystem::path model_directory;
     int max_tokens = 64;
+    int prefix_cache_tokens = 0;
     long cloud_timeout_ms = 90000;
     std::chrono::milliseconds cloud_cooldown{0};
     bool demo = false;
     bool offline = false;
+    bool trace_token_ids = false;
     bool batch = false;
 };
 
@@ -133,8 +135,10 @@ Arguments arguments(int argc, char** argv) {
             args.offline = true;
         } else if (arg == "--batch") {
             args.batch = true;
+        } else if (arg == "--trace-token-ids") {
+            args.trace_token_ids = true;
         } else if (arg == "--prompt" || arg == "--model" || arg == "--max-tokens"
-                   || arg == "--cloud-timeout-ms" || arg == "--cloud-cooldown-ms") {
+                   || arg == "--cloud-timeout-ms" || arg == "--cloud-cooldown-ms" || arg == "--prefix-cache-tokens") {
             if (++i >= argc) {
                 throw std::runtime_error("Missing value for " + std::string(arg));
             }
@@ -147,6 +151,8 @@ Arguments arguments(int argc, char** argv) {
                 args.max_tokens = positive_integer(arg, value, 1024);
             } else if (arg == "--cloud-timeout-ms") {
                 args.cloud_timeout_ms = positive_integer(arg, value, 600000);
+            } else if (arg == "--prefix-cache-tokens") {
+                args.prefix_cache_tokens = positive_integer(arg, value, max_prefix_cache_tokens);
             } else {
                 args.cloud_cooldown = std::chrono::milliseconds(positive_integer(arg, value, 600000));
             }
@@ -169,6 +175,9 @@ Arguments arguments(int argc, char** argv) {
     if (args.cloud_cooldown.count() > 0
         && (!args.batch || args.demo || args.offline || args.model_directory.empty())) {
         throw std::runtime_error("--cloud-cooldown-ms requires cloud-first --batch with --model DIR.");
+    }
+    if (args.prefix_cache_tokens > 0 && (!args.batch || args.model_directory.empty())) {
+        throw std::runtime_error("--prefix-cache-tokens requires --batch and --model DIR.");
     }
     return args;
 }
@@ -210,11 +219,11 @@ public:
         double load_ms = 0.0;
         if (!local_) {
             const auto start = std::chrono::steady_clock::now();
-            local_ = std::make_unique<LocalModel>(args_.model_directory);
+            local_ = std::make_unique<LocalModel>(args_.model_directory, args_.prefix_cache_tokens);
             load_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
         }
         auto result = local_->generate(prompt, max_tokens);
-        return {
+        Json output{
             {"source", "mlx"},
             {"cloud_status", cloud_status ? Json(*cloud_status) : Json(nullptr)},
             {"fallback_reason", fallback},
@@ -222,9 +231,14 @@ public:
             {"local_metrics", {
                 {"model_reused", reused}, {"load_ms", load_ms}, {"prefill_ms", result.prefill_ms},
                 {"generation_ms", result.generation_ms}, {"prompt_tokens", result.prompt_tokens},
-                {"generated_tokens", result.generated_tokens}
+                {"generated_tokens", result.token_ids.size()},
+                {"reused_prefix_tokens", result.reused_prefix_tokens},
+                {"retained_prefix_tokens", result.retained_prefix_tokens},
+                {"retained_prefix_bytes", result.retained_prefix_bytes}
             }}
         };
+        if (args_.trace_token_ids) output["generated_token_ids"] = std::move(result.token_ids);
+        return output;
 #else
         throw std::runtime_error("Build with EDGE_ENABLE_MLX=ON to use a local model.");
 #endif
@@ -278,7 +292,8 @@ int main(int argc, char** argv) {
     try {
         if (argc == 1 || (argc == 2 && std::string_view(argv[1]) == "--help")) {
             std::cout << "edge_fallback [--demo | --offline] [--prompt TEXT | --batch] [--model DIR] [--max-tokens N] "
-                         "[--cloud-timeout-ms N] [--cloud-cooldown-ms N]\n";
+                         "[--cloud-timeout-ms N] [--cloud-cooldown-ms N] "
+                         "[--prefix-cache-tokens N] [--trace-token-ids]\n";
             return 0;
         }
         const auto args = arguments(argc, argv);

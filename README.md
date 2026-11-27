@@ -67,6 +67,53 @@ The circuit starts closed and is disabled unless a cooldown is supplied.
 HTTP 429, other error statuses, and ambiguous transport failures remain
 visible as errors. The default cloud request deadline is 90 seconds.
 
+## Reuse the start of a prompt
+
+Use `--prefix-cache-tokens N` with `--batch --model DIR` when requests
+share the same opening context. The batch retains one prefix of exactly N
+token IDs after chat formatting. A hit restores its per-layer K/V arrays and
+runs prefill on the remaining suffix at the original positions. A different
+leading sequence evicts the old entry. Prompts with no suffix use ordinary
+prefill and leave the current entry intact. Each generation gets its own
+suffix and decode state.
+
+The model checks the option against its context limit and a 256 MiB logical
+K/V budget calculated conservatively with four bytes per element. The limit
+covers the retained prefix. Layer activations, the request's full K/V cache,
+weights, and allocator overhead also use memory. Local replies report
+`reused_prefix_tokens`, `retained_prefix_tokens`, and `retained_prefix_bytes`.
+Pass `--trace-token-ids` to include the generated IDs for parity checks.
+
+```sh
+sh bench/prefix_ab.sh ./build-mlx/edge_fallback /path/to/checkpoint 1024 6 > paired.csv
+```
+
+The benchmark requires `jq`. It runs the same release binary with prefix
+reuse disabled and enabled, alternates process order, and checks all
+generated IDs and cache outcomes before emitting CSV.
+
+### Measured on Apple Metal
+
+The release build ran Llama 3.2 3B Instruct 4-bit on an Apple M3 Pro with
+MLX 0.32.5. Six alternating process pairs each sent eight requests. The
+handbook requests had 1,355 prompt tokens and the short request had 24.
+All 48 pairs returned the same greedy token IDs and each response generated
+one token. The retained 1,024-token prefix used 112 MiB of K/V payload.
+
+| Case | Pairs | Median prefill without reuse | Median prefill with cache enabled |
+|---|---:|---:|---:|
+| Exact prefix hit | 24 | 1,826.3 ms | 449.2 ms |
+| Different prefix replaces the entry | 12 | 1,756.5 ms | 1,631.6 ms |
+| Short prompt uses ordinary prefill | 6 | 72.4 ms | 58.5 ms |
+
+The median of the paired hit speed ratios was 3.85×. Hit p90 was 2,075.2 ms
+without reuse and 526.7 ms with reuse, using nearest-rank percentiles. Prefill
+time includes tokenization and the first greedy decision. Model loading is
+separate. The six cold warmup rows are outside the table. The short case
+runs the same code in both configurations and shows run-to-run variation.
+These results describe prefill and one-token responses for this workload.
+[Raw timing pairs](evidence/llama-3b-prefix-ab.csv) · [Build and checkpoint fingerprints](evidence/llama-3b-prefix-ab-environment.txt)
+
 ## Tests
 
 The default build tests the CLI against a local HTTP server. It covers cloud
@@ -85,7 +132,9 @@ handling, and invalid checkpoint files. For the cached 4-bit Llama 3.2 3B
 integration test, configure `build-mlx` with
 `-DEDGE_TEST_MODEL=/path/to/Llama-3.2-3B-Instruct-4bit`.
 Run `ctest --test-dir build-mlx --output-on-failure` to include the real
-checkpoint. A local server supplies the HTTP 503 responses.
+checkpoint. A local server supplies the HTTP 503 responses. The prefix test
+checks exact token parity against ordinary prefill, including multi-token
+decode, prefix replacement, and an intervening short request.
 
 To measure the application and MLX code, configure each build separately
 with Clang and `-DCMAKE_CXX_FLAGS="-fprofile-instr-generate -fcoverage-mapping"`.

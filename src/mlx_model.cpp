@@ -12,6 +12,7 @@
 #include <iterator>
 #include <numbers>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <unordered_map>
 #include <vector>
@@ -90,9 +91,29 @@ struct Config {
     }
 };
 
+std::size_t validate_prefix_capacity(const Config& config, std::size_t capacity) {
+    constexpr std::size_t max_bytes = 256 * 1024 * 1024;
+    // Reserve for the largest supported K/V element size, regardless of model weight packing.
+    const auto token_budget = max_bytes / 2 / sizeof(float) / config.layers
+        / config.kv_heads / (config.hidden / config.heads);
+    if (capacity > max_prefix_cache_tokens || capacity > token_budget
+        || capacity >= static_cast<std::size_t>(config.max_context)) {
+        throw std::runtime_error("Prefix cache exceeds the 256 MiB or model context limit.");
+    }
+    return capacity;
+}
+
 struct Cache {
     mx::array keys;
     mx::array values;
+};
+
+using LayerCaches = std::vector<std::optional<Cache>>;
+
+struct Prefix {
+    std::vector<std::int32_t> tokens;
+    LayerCaches layers;
+    std::size_t bytes;
 };
 
 std::optional<mx::array> rope_periods(const Json& config, int head_size, float base) {
@@ -129,7 +150,7 @@ std::optional<mx::array> rope_periods(const Json& config, int head_size, float b
 class Decoder {
     const Config& config_;
     const Weights& weights_;
-    std::vector<std::optional<Cache>> cache_;
+    LayerCaches cache_;
     const std::optional<mx::array>& rope_periods_;
     int offset_ = 0;
 
@@ -154,7 +175,7 @@ class Decoder {
         return output;
     }
 
-    mx::array embeddings(const std::vector<std::int32_t>& tokens) const {
+    mx::array embeddings(std::span<const std::int32_t> tokens) const {
         const mx::array ids(tokens.begin(), {static_cast<int>(tokens.size())});
         const std::string name = "model.embed_tokens";
         auto rows = mx::take(weight(name + ".weight"), ids, 0);
@@ -184,6 +205,7 @@ class Decoder {
             values = mx::concatenate({cache_[layer]->values, values}, 2);
         }
         cache_[layer] = Cache{keys, values};
+        // MLX aligns the last query with the last key for cached multi-token suffixes.
         auto attention = mx::fast::scaled_dot_product_attention(
             queries, keys, values, 1.0f / std::sqrt(static_cast<float>(head_size)), -1,
             steps > 1 ? "causal" : "");
@@ -191,11 +213,7 @@ class Decoder {
                                   {steps, config_.hidden}), base + ".o_proj");
     }
 
-public:
-    Decoder(const Config& config, const Weights& weights, const std::optional<mx::array>& periods)
-        : config_(config), weights_(weights), cache_(config.layers), rope_periods_(periods) {}
-
-    int next_token(const std::vector<std::int32_t>& tokens) {
+    mx::array forward(std::span<const std::int32_t> tokens) {
         const auto steps = static_cast<int>(tokens.size());
         for (auto token : tokens) {
             if (token < 0 || token >= config_.vocabulary) {
@@ -214,11 +232,34 @@ public:
             hidden = hidden + linear(activated * linear(mlp_input, name + ".mlp.up_proj"), name + ".mlp.down_proj");
         }
         offset_ += steps;
-        const auto last = mx::take(hidden, steps - 1, 0);
+        return hidden;
+    }
+
+public:
+    Decoder(const Config& config, const Weights& weights, const std::optional<mx::array>& periods)
+        : config_(config), weights_(weights), cache_(config.layers), rope_periods_(periods) {}
+
+    Prefix prefill_prefix(std::span<const std::int32_t> tokens) {
+        (void)forward(tokens);
+        std::size_t bytes = 0;
+        for (const auto& layer : cache_) {
+            bytes += layer->keys.nbytes() + layer->values.nbytes();
+        }
+        return {std::vector<std::int32_t>(tokens.begin(), tokens.end()), cache_, bytes};
+    }
+
+    void restore_prefix(const Prefix& prefix) {
+        cache_ = prefix.layers;
+        offset_ = static_cast<int>(prefix.tokens.size());
+    }
+
+    std::int32_t next_token(std::span<const std::int32_t> tokens) {
+        const auto hidden = forward(tokens);
+        const auto last = mx::take(hidden, static_cast<int>(tokens.size()) - 1, 0);
         const auto final = mx::reshape(mx::fast::rms_norm(last, weight("model.norm.weight"), config_.epsilon),
                                        {1, config_.hidden});
         const auto logits = linear(final, config_.tied_embedding ? "model.embed_tokens" : "lm_head");
-        return static_cast<int>(mx::argmax(logits).item<std::uint32_t>());
+        return static_cast<std::int32_t>(mx::argmax(logits).item<std::uint32_t>());
     }
 };
 
@@ -237,14 +278,17 @@ std::string chat_prompt(const std::string& prompt, const Json& config) {
 struct LocalModel::Impl {
     Json config_json;
     Config config;
+    const std::size_t prefix_capacity;
     Weights weights;
     std::optional<mx::array> periods;
     std::unique_ptr<tokenizers::Tokenizer> tokenizer;
     std::vector<int> stop_ids;
+    std::optional<Prefix> prefix;
 
-    explicit Impl(const std::filesystem::path& directory)
+    Impl(const std::filesystem::path& directory, std::size_t prefix_tokens)
         : config_json(Json::parse(read_file(directory / "config.json"))),
-          config(config_json), weights(load_weights(directory)),
+          config(config_json), prefix_capacity(validate_prefix_capacity(config, prefix_tokens)),
+          weights(load_weights(directory)),
           periods(rope_periods(config_json, config.hidden / config.heads, config.rope_base)),
           tokenizer(tokenizers::Tokenizer::FromBlobJSON(read_file(directory / "tokenizer.json"))) {
         if (!tokenizer) {
@@ -264,12 +308,12 @@ struct LocalModel::Impl {
     }
 };
 
-LocalModel::LocalModel(const std::filesystem::path& directory) {
+LocalModel::LocalModel(const std::filesystem::path& directory, std::size_t prefix_tokens) {
     if (!mx::is_available(mx::Device::gpu)) {
         throw std::runtime_error("MLX Metal GPU is unavailable.");
     }
     mx::set_default_device(mx::Device::gpu);
-    impl_ = std::make_unique<Impl>(directory);
+    impl_ = std::make_unique<Impl>(directory, prefix_tokens);
 }
 
 LocalModel::~LocalModel() = default;
@@ -285,20 +329,42 @@ LocalGeneration LocalModel::generate(const std::string& prompt, int max_tokens) 
         throw std::runtime_error("Prompt and generation budget exceed the model context.");
     }
     Decoder decoder(model.config, model.weights, model.periods);
+    std::span<const std::int32_t> suffix(prompt_tokens);
+    std::optional<Prefix> replacement;
+    std::size_t reused_tokens = 0;
+    if (model.prefix_capacity > 0 && suffix.size() > model.prefix_capacity) {
+        const auto leading = suffix.first(model.prefix_capacity);
+        if (model.prefix && std::ranges::equal(model.prefix->tokens, leading)) {
+            decoder.restore_prefix(*model.prefix);
+            reused_tokens = leading.size();
+        } else {
+            // Drop the prior anchor before allocating a different one.
+            model.prefix.reset();
+            replacement = decoder.prefill_prefix(leading);
+        }
+        suffix = suffix.subspan(leading.size());
+    }
+
     std::vector<std::int32_t> generated;
-    auto next = decoder.next_token(prompt_tokens);
+    generated.reserve(max_tokens);
+    auto next = decoder.next_token(suffix);
     const auto first = Clock::now();
     while (std::find(model.stop_ids.begin(), model.stop_ids.end(), next) == model.stop_ids.end()) {
         generated.push_back(next);
         if (generated.size() >= static_cast<std::size_t>(max_tokens)) {
             break;
         }
-        next = decoder.next_token({next});
+        next = decoder.next_token(std::span(&next, 1));
     }
     auto text = model.tokenizer->Decode(generated);
+    // next_token synchronized the suffix and the prefix K/V it consumed. Cache
+    // only the prefix, whose handles were saved before any suffix was appended.
+    if (replacement) model.prefix = std::move(*replacement);
     const auto milliseconds = [](auto duration) {
         return std::chrono::duration<double, std::milli>(duration).count();
     };
-    return {std::move(text), prompt_tokens.size(), generated.size(),
+    return {std::move(text), prompt_tokens.size(), std::move(generated), reused_tokens,
+            model.prefix ? model.prefix->tokens.size() : 0,
+            model.prefix ? model.prefix->bytes : 0,
             milliseconds(first - started), milliseconds(Clock::now() - started)};
 }

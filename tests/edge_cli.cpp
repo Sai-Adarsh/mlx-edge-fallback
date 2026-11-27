@@ -140,6 +140,8 @@ void test_arguments_and_batch(const Cli& cli, bool mlx) {
     rejects(cli, {"--max-tokens", "1x"}, "must be an integer");
     rejects(cli, {"--max-tokens", "0"}, "must be an integer");
     rejects(cli, {"--max-tokens", "1025"}, "must be an integer");
+    rejects(cli, {"--batch", "--prefix-cache-tokens", "8"}, "requires --batch and --model");
+    rejects(cli, {"--batch", "--model", "local", "--prefix-cache-tokens", "4097"}, "must be an integer");
     rejects(cli, {"--batch", "--cloud-timeout-ms", "-1"}, "must be an integer");
     rejects(cli, {"--batch", "--cloud-cooldown-ms", "600001"}, "must be an integer");
     rejects(cli, {"--batch", "--cloud-cooldown-ms", "5"}, "requires cloud-first --batch with --model");
@@ -298,6 +300,29 @@ void test_dense_checkpoint(const Cli& cli) {
             rows[1].dump());
     require(rows[2].at("local_metrics").at("generated_tokens") == 1, rows[2].dump());
 
+    auto prefix_args = args;
+    const auto prompt_size = rows[2].at("local_metrics").at("prompt_tokens").get<int>();
+    prefix_args.insert(prefix_args.end(), {"--prefix-cache-tokens", std::to_string(prompt_size - 1),
+                                           "--trace-token-ids"});
+    const std::string prompt = R"({"prompt":"hello","max_tokens":1})";
+    const auto prefix_rows = batch(cli.run(prefix_args, prompt + "\n" + prompt), 2);
+    require(prefix_rows[0].at("generated_token_ids") == Json::array({2}), prefix_rows[0].dump());
+    require(prefix_rows[1].at("generated_token_ids") == Json::array({2}), prefix_rows[1].dump());
+    require(prefix_rows[1].at("local_metrics").at("reused_prefix_tokens") == prompt_size - 1, prefix_rows[1].dump());
+    require(!rows[2].contains("generated_token_ids"), rows[2].dump());
+
+    auto exact_length = args;
+    exact_length.insert(exact_length.end(), {"--prefix-cache-tokens", std::to_string(prompt_size)});
+    const auto no_suffix = batch(cli.run(exact_length, prompt), 1).front();
+    require(no_suffix.at("ok") == true && no_suffix.at("local_metrics").at("retained_prefix_tokens") == 0,
+            no_suffix.dump());
+
+    auto invalid_prefix = args;
+    invalid_prefix.insert(invalid_prefix.end(), {"--prefix-cache-tokens", "16"});
+    const auto over_limit = batch(cli.run(invalid_prefix, prompt), 1).front();
+    require(over_limit.at("ok") == false && over_limit.at("error").get<std::string>().find("model context limit")
+            != std::string::npos, over_limit.dump());
+
     const auto expect_error = [&](std::string_view error) {
         const auto row = batch(cli.run(args, request), 1).front();
         require(row.at("ok") == false && row.at("error").get<std::string>().find(error) != std::string::npos, row.dump());
@@ -381,6 +406,47 @@ void test_mlx(const Cli& cli, const std::string& model, bool cooldown) {
             && offline[0].at("local_metrics").at("generated_tokens") == 1, offline[0].dump());
     require(offline[1].at("error") == "Prompt contains a reserved chat token prefix.", offline[1].dump());
 }
+void test_prefix_cache(const Cli& cli, const std::string& model) {
+    std::string common = "Use the following service handbook to answer the final question.\n";
+    for (int i = 1; i <= 18; ++i) {
+        common += "Service " + std::to_string(i) + " uses the standard weekday schedule and records all changes.\n";
+    }
+    const std::string north = "The reference ticket number is 17.\n";
+    const std::string south = "The reference ticket number is 38.\n";
+    const std::string ask_ticket = "What is the reference ticket number in the first sentence? Reply with just the number.";
+    const auto first = north + common + ask_ticket;
+    const auto second = north + common + "Write six even numbers starting at two, separated by commas.";
+    const auto changed = south + common + ask_ticket;
+    const auto short_prompt = "What is 1 plus 1?";
+    const std::vector<std::string> prompts{first, second, short_prompt, first, changed, first, second};
+    std::string input;
+    for (const auto& prompt : prompts) input += Json{{"prompt", prompt}}.dump() + "\n";
+
+    const std::vector<std::string> base{"--batch", "--offline", "--model", model,
+                                        "--max-tokens", "4", "--trace-token-ids"};
+    auto enabled = base;
+    enabled.insert(enabled.end(), {"--prefix-cache-tokens", "128"});
+    const auto original = batch(cli.run(base, input), prompts.size());
+    const auto cached = batch(cli.run(enabled, input), prompts.size());
+    const std::vector<int> reuse{0, 128, 0, 128, 0, 0, 128};
+    require(original[0].at("generated_token_ids") != original[4].at("generated_token_ids"),
+            "fixture answer did not depend on the replaced prefix");
+    require(original[1].at("generated_token_ids").size() > 1, "fixture did not exercise cached decode");
+    for (std::size_t i = 0; i < prompts.size(); ++i) {
+        const auto& row = cached[i];
+        require(row.at("ok") == true && original[i].at("ok") == true, row.dump());
+        require(!row.at("generated_token_ids").empty() &&
+                row.at("generated_token_ids") == original[i].at("generated_token_ids"),
+                "token parity failed for row " + std::to_string(i + 1) + ": " + row.dump());
+        require(row.at("text") == original[i].at("text"), row.dump());
+        const auto& metrics = row.at("local_metrics");
+        require(metrics.at("reused_prefix_tokens") == reuse[i], row.dump());
+        require(metrics.at("retained_prefix_tokens") == 128, row.dump());
+        require(metrics.at("retained_prefix_bytes").get<std::size_t>() > 0, row.dump());
+        require(original[i].at("local_metrics").at("retained_prefix_bytes") == 0, original[i].dump());
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) try {
@@ -391,7 +457,10 @@ int main(int argc, char** argv) try {
     unsetenv("CLOUD_API_KEY");
     const Cli cli(argv[1]);
     const std::string_view mode = argv[2];
-    if (mode == "mlx" || mode == "mlx-cooldown") {
+    if (mode == "mlx-prefix") {
+        require(argc == 4, "missing test model");
+        test_prefix_cache(cli, argv[3]);
+    } else if (mode == "mlx" || mode == "mlx-cooldown") {
         require(argc == 4, "missing test model");
         test_mlx(cli, argv[3], mode == "mlx-cooldown");
 #ifdef EDGE_TEST_MLX
