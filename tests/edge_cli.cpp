@@ -190,7 +190,7 @@ public:
     }
 
     void exchange(std::string_view prompt, int tokens, std::string_view status, const std::string& content,
-                  int wait_ms = 8000, std::size_t missing_bytes = 0) {
+                  int wait_ms = 8000, std::size_t missing_bytes = 0, bool wait_for_close = false) {
         pollfd listener{socket_.get(), POLLIN, 0};
         require(poll(&listener, 1, wait_ms) == 1, "edge CLI did not connect");
         Socket connection(accept(socket_.get(), nullptr, nullptr));
@@ -229,6 +229,12 @@ public:
             require(count > 0, "writing HTTP response failed");
             sent += static_cast<std::size_t>(count);
         }
+        if (wait_for_close) {
+            pollfd peer{connection.get(), POLLIN, 0};
+            require(poll(&peer, 1, wait_ms) == 1, "edge CLI waited for an unavailable response body");
+            char byte;
+            require(recv(connection.get(), &byte, 1, 0) == 0, "edge CLI did not close the stalled response");
+        }
     }
 };
 
@@ -263,10 +269,11 @@ void test_cloud(const Cli& cli) {
     test_circuit_clock();
     Server server;
     point_at(server);
-    const auto pid = cli.start({"--batch", "--max-tokens", "16"},
+    const auto pid = cli.start({"--batch", "--max-tokens", "16", "--cloud-timeout-ms", "15000"},
         "{\"prompt\":\"one\"}\n{\"prompt\":\"two\",\"max_tokens\":8}\n"
         "{\"prompt\":\"three\"}\n{\"prompt\":\"four\"}\n{\"prompt\":\"five\"}\n"
-        "{\"prompt\":\"truncated unavailable\"}\n{\"prompt\":\"truncated success\"}\n");
+        "{\"prompt\":\"truncated unavailable\"}\n{\"prompt\":\"truncated success\"}\n"
+        "{\"prompt\":\"stalled unavailable\"}\n{\"prompt\":\"after stalled response\"}\n");
     server.exchange("one", 16, "200 OK", R"({"choices":[{"message":{"content":"upstream"}}]})");
     server.exchange("two", 8, "503 Service Unavailable", "{}");
     server.exchange("three", 16, "429 Too Many Requests", "{}");
@@ -274,7 +281,9 @@ void test_cloud(const Cli& cli) {
     server.exchange("five", 16, "200 OK", std::string(4 * 1024 * 1024 + 1, 'a'));
     server.exchange("truncated unavailable", 16, "503 Service Unavailable", "{}", 8000, 1);
     server.exchange("truncated success", 16, "200 OK", R"({"choices":[{"message":{"content":"partial"}}]})", 8000, 1);
-    const auto rows = batch(cli.finish(pid), 7);
+    server.exchange("stalled unavailable", 16, "503 Service Unavailable", "", 5000, 1, true);
+    server.exchange("after stalled response", 16, "200 OK", R"({"choices":[{"message":{"content":"recovered"}}]})");
+    const auto rows = batch(cli.finish(pid), 9);
     require(rows[0].at("source") == "cloud" && rows[0].at("text") == "upstream", rows[0].dump());
     require(rows[1].at("error").get<std::string>().find("Pass --model") != std::string::npos, rows[1].dump());
     require(rows[2].at("error") == "Cloud HTTP 429", rows[2].dump());
@@ -282,6 +291,8 @@ void test_cloud(const Cli& cli) {
     require(rows[4].at("error").get<std::string>().starts_with("Cloud request failed:"), rows[4].dump());
     require(rows[5].at("error").get<std::string>().find("Pass --model") != std::string::npos, rows[5].dump());
     require(rows[6].at("error").get<std::string>().starts_with("Cloud request failed:"), rows[6].dump());
+    require(rows[7].at("error").get<std::string>().find("Pass --model") != std::string::npos, rows[7].dump());
+    require(rows[8].at("source") == "cloud" && rows[8].at("text") == "recovered", rows[8].dump());
 }
 
 #ifdef EDGE_TEST_MLX

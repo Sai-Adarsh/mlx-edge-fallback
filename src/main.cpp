@@ -29,6 +29,17 @@ std::string environment(const char* name) {
     return value ? value : "";
 }
 
+std::size_t finish_on_unavailable(char* data, std::size_t size, std::size_t count, void* target) {
+    const auto bytes = size * count;
+    const std::string_view line(data, bytes);
+    if (line == "\r\n" || line == "\n") {
+        long status = 0;
+        curl_easy_getinfo(static_cast<CURL*>(target), CURLINFO_RESPONSE_CODE, &status);
+        if (status == 503) return 0;
+    }
+    return bytes;
+}
+
 std::size_t append_response(char* data, std::size_t size, std::size_t count, void* target) {
     auto& response = *static_cast<std::string*>(target);
     const auto bytes = size * count;
@@ -84,11 +95,13 @@ Reply call_cloud(std::string base, const std::string& model, const std::string& 
     curl_easy_setopt(curl.get(), CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(payload.size()));
     curl_easy_setopt(curl.get(), CURLOPT_CONNECTTIMEOUT_MS, std::min(10000L, timeout_ms));
     curl_easy_setopt(curl.get(), CURLOPT_TIMEOUT_MS, timeout_ms);
+    curl_easy_setopt(curl.get(), CURLOPT_HEADERFUNCTION, finish_on_unavailable);
+    curl_easy_setopt(curl.get(), CURLOPT_HEADERDATA, curl.get());
     curl_easy_setopt(curl.get(), CURLOPT_WRITEFUNCTION, append_response);
     curl_easy_setopt(curl.get(), CURLOPT_WRITEDATA, &reply.body);
     const auto result = curl_easy_perform(curl.get());
     curl_easy_getinfo(curl.get(), CURLINFO_RESPONSE_CODE, &reply.status);
-    // A final 503 is sufficient to switch models even if its error body breaks.
+    // The header callback stops a 503 transfer before libcurl reads the body.
     if (result != CURLE_OK && reply.status != 503) {
         throw std::runtime_error(std::string("Cloud request failed: ") + curl_easy_strerror(result));
     }
